@@ -71,7 +71,6 @@ class DynaQ:
                 q_values = self.q[tuple(s)]
                 action_scores = self.model.get_action_scores(s)
                 p_scores = q_values + action_scores
-                p_scores = [i / np.sum(p_scores) for i in p_scores]
                 a = np.argmax(p_scores)
 
             # Take action, observe outcome
@@ -84,14 +83,11 @@ class DynaQ:
                 # revert to boundary
                 if not (0 <= s_prime[0] <= self.grid_size - 1):
                     s_prime[0] = self.grid_size - 1
-                else:
+                if not (0 <= s_prime[1] <= self.grid_size - 1):
                     s_prime[1] = self.grid_size - 1
-
-            unbounded, _ = self.model.get_action(s_prime)
-
             # Q-Learning
             idx = tuple(np.concatenate([s, [int(a)]]))
-            update = r + self.gamma * np.max(self.q[s_prime]) - self.q[idx]
+            update = r + self.gamma * np.max(self.q[tuple(s_prime)]) - self.q[idx]
             if step == 1:
                 self.avg_update = update
             else:
@@ -101,7 +97,7 @@ class DynaQ:
 
             # Check if update > theta, if yes: push to PQueue
             if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                self.p_queue.add((abs(update), (s, a)))
+                self.p_queue.add((abs(update), (tuple(s), a)))
 
             # Learn model
             self.model.add(s, a, s_prime, r)
@@ -178,8 +174,7 @@ class DynaQ:
                             r_bar + self.gamma * np.max(self.q[tuple(s)]) - self.q[idx]
                         )
                         if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                            self.p_queue.add((abs(update), [list(state), a_i]))
-                            # print(s, state, update)
+                            self.p_queue.add((abs(update), (tuple(state), a_i)))
 
 
 class Model:
@@ -254,7 +249,6 @@ class Model:
         """
         x, y = s
         unbounded = False
-
         if x == 0 or x >= self.grid_size - 1:
             a = [2, 3, 1 - x // self.grid_size]
             unbounded = True
@@ -372,7 +366,7 @@ if __name__ == "__main__":
     epsilon = 1.0
     max_steps = 2000
     planning_steps = 10
-    max_episodes = 5000
+    max_episodes = 1000
 
     json_file = "content/pw2.json"
     with open(json_file) as f:
