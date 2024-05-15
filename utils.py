@@ -1,9 +1,13 @@
 import heapq
+from collections import deque
+import os
+# Keep using keras-2 (tf-keras) rather than keras-3 (keras).
+
 import numpy as np
-import tensorflow as tf
 import keras
-from tf_agents.replay_buffers import tf_uniform_replay_buffer
-from tf_agents.agents import DqnAgent
+import tensorflow as tf
+from tf_agents.replay_buffers import py_uniform_replay_buffer
+from tf_agents.specs import tensor_spec
 
 
 class PQueue:
@@ -60,123 +64,104 @@ class PQueue:
             return item
 
 
-# class QNetwork:
+class QNetwork:
 
-#     def __init__(
-#         self,
-#         input_dims: tuple,
-#         output_dims: int,
-#         lr: float = 0.001,
-#         dims: list = [32, 32],
-#         batch_size: int = 32,
-#         buffer_length: int = 10000
-#     ):
-
-#         self.input_dims = input_dims
-#         self.n_output = output_dims
-#         self.lr = lr
-#         self.dims = dims
-#         self.batch_size = batch_size
-        
-#         self.opt = keras.optimizers.Adam(lr)
-#         self.loss = keras.losses.Huber()
-#         self.model = self._build_model()
-
-#         self.data_spec = (
-#             tf.TensorSpec([None,], tf.float32, 'state'),
-#             tf.TensorSpec([1], tf.float32, 'action'),
-#             tf.TensorSpec([1], tf.float32, 'reward'),
-#             tf.TensorSpec([None,], tf.float32, 'next_state')
-#         )
-#         self.replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-#             self.data_spec,
-#             batch_size=batch_size,
-#             max_length=buffer_length
-#         )
-
-#         self.gamma = 0.99
-
-#     def _build_model(self):
-
-#         model = keras.Sequential(
-#             [
-#                 keras.layers.Input(
-#                     shape=self.input_dims,
-#                     batch_size=self.batch_size,
-#                 ),
-#                 *[keras.layers.Dense(dim, activation=tf.nn.relu) for dim in self.dims],
-#                 keras.layers.Dense(self.n_output)
-
-#             ]
-#         )
-#         model.compile(optimizer=self.opt, loss=self.loss)
-#         return model
-    
-#     def collect_rollout(self, sars: tuple):
-
-#         tf.ensure_shape(sars, self.data_spec)
-#         self.replay_buffer.add_batch(sars)
-
-#     def learn(self):
-#         """
-#         Update QNetwork parameters given replay mini-batch
-#         """
-#         sample = self.replay_buffer.get_next(self.batch_size)
-        
-#         # compute Q-targets and current Q values, get loss from TD error
-#         # take gradient over batch
-#         for (s, a, r, s_) in sample:
-#             q_value = self.model.predict(s)
-#             q_max = np.max(self.model.predict(s_))
-#             td_error = np.square(r + self.gamma * q_max - q_value)
-
-#             self.model.compute_loss()
-
-
-class DQNAgent:
-    def __init__(self, input_dims: tuple,
+    def __init__(
+        self,
+        input_dims: tuple,
         output_dims: int,
         lr: float = 0.001,
+        gamma: float = 0.99,
+        lambd: float = 0.5,
         dims: list = [32, 32],
         batch_size: int = 32,
-        buffer_length: int = 10000):
+        buffer_length: int = 10000,
+    ):
 
         self.input_dims = input_dims
         self.n_output = output_dims
         self.lr = lr
         self.dims = dims
         self.batch_size = batch_size
-        
-        self.opt = keras.optimizers.Adam(lr)
-        self.loss = keras.losses.Huber()
+        self.gamma = gamma
+        self.lambd = lambd
+
+        self.opt = tf.keras.optimizers.Adam(lr)
+        self.loss = tf.keras.losses.Huber()
         self.model = self._build_model()
 
         self.data_spec = (
-            tf.TensorSpec([None,], tf.float32, 'state'),
-            tf.TensorSpec([1], tf.float32, 'action'),
-            tf.TensorSpec([1], tf.float32, 'reward'),
-            tf.TensorSpec([None,], tf.float32, 'next_state')
+            tf.TensorSpec(
+                [
+                    None,
+                ],
+                tf.float32,
+                "state",
+            ),
+            tf.TensorSpec([1], tf.float32, "action"),
+            tf.TensorSpec([1], tf.float32, "reward"),
+            tf.TensorSpec(
+                [
+                    None,
+                ],
+                tf.float32,
+                "next_state",
+            ),
         )
-        self.replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-            self.data_spec,
-            batch_size=batch_size,
-            max_length=buffer_length
+        self.replay_buffer = py_uniform_replay_buffer.PyUniformReplayBuffer(
+            tensor_spec.to_array_spec(self.data_spec),
+            capacity=buffer_length * self.batch_size,
         )
-
-        self.gamma = 0.99
+        self.temp_buffer = deque()
 
     def _build_model(self):
 
-        model = keras.Sequential(
-            [
-                keras.layers.Input(
-                    shape=self.input_dims,
-                    batch_size=self.batch_size,
-                ),
-                *[keras.layers.Dense(dim, activation=tf.nn.relu) for dim in self.dims],
-                keras.layers.Dense(self.n_output)
-
-            ]
+        inp = tf.keras.layers.Input(
+            shape=self.input_dims,
+            batch_size=self.batch_size,
         )
-        model.compile(optimizer=self.opt, loss=self.loss)
+        x = inp
+        for dim in self.dims:
+            x = tf.keras.layers.Dense(dim, activation=tf.nn.relu)(x)
+
+        out = tf.keras.layers.Dense(self.n_output)(x)
+        model = tf.keras.Model(inputs=[inp], outputs=[out])
         return model
+
+    def collect_rollout(self, sars: tuple):
+
+        tf.ensure_shape(sars, self.data_spec)
+        self.temp_buffer.append(sars)
+        if len(self.temp_buffer) == self.batch_size:
+            # add batch dim to items and append to replay buffer
+            item = tf.reshape(self.temp_buffer, (1, *tf.shape(self.temp_buffer)))
+            self.replay_buffer.add_batch(item)
+
+            # clear temp buffer
+            self.temp_buffer.clear()
+
+    def predict(self, state):
+
+        tf.ensure_shape(state, self.data_spec[0])
+        return self.model.predict(state)
+
+    def learn(self):
+        """
+        Update QNetwork parameters given replay mini-batch
+        """
+        sample = self.replay_buffer.get_next(self.batch_size)
+
+        # compute Q-targets and current Q values, get loss from TD error
+        # take gradient over batch
+        s = sample[:, 0]
+        a = sample[:, 1]
+        r = sample[:, 2]
+        s_ = sample[:, 3]
+        print(s)
+        q_value = self.model.predict(s)
+        q_target = r + self.gamma * np.max(self.model.predict(s_))
+
+        loss = self.loss(q_target, q_value)
+        grads = tf.gradients(loss, self.model.trainable_weights)
+        grads = self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
+        return grads

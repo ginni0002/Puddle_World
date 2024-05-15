@@ -4,6 +4,7 @@ import random
 import gym_puddle
 import gymnasium as gym
 
+
 class Model:
     def __init__(self, grid_size, n_states, n_actions, env_params, h_weight):
 
@@ -15,17 +16,14 @@ class Model:
         self.state_dims = len(self.n_states)
         self.grid_size = grid_size
         self.hash_list = []
+        self.set_env_params(env_params)
+        self.action_map = {"x": {-1: 0, 0: -1, 1: 1}, "y": {-1: 2, 0: -1, 1: 3}}
+        self.h_weight = h_weight
+
+    def set_env_params(self, env_params):
         self.start_pos = env_params["start"]
         self.goal_pos = env_params["goal"]
         self.noise = env_params["noise"]
-        self.action_map = {"x": {-1: 0, 0: -1, 1: 1}, "y": {-1: 2, 0: -1, 1: 3}}
-        self.prev_dist = np.sum(
-            [
-                np.abs(self.start_pos[i] - self.goal_pos[i])
-                for i in range(len(self.start_pos))
-            ]
-        )
-        self.h_weight = h_weight
 
     def add(self, s, a, s_prime, r):
         """
@@ -78,6 +76,9 @@ class Model:
         x, y = s
         unbounded = False
         if x == 0 or x >= self.grid_size - 1:
+            # if at the vertical edges, movement restricted in x direction
+            # 1-x/grid_size -> returns 0 if x at 1 and 1 if x at 0
+
             a = [2, 3, 1 - x // self.grid_size]
             unbounded = True
         elif y == 0 or y >= self.grid_size - 1:
@@ -93,7 +94,6 @@ class Model:
         Return array of action scores based on heuristic
         Heuristic: distance between current state and goal state
         """
-        # convert s to  [0., 1.]
         direction_vec, dist = self.get_direction_vec(s)
         a_towards_goal = [
             self.action_map["x"][direction_vec[0]],
@@ -112,7 +112,9 @@ class Model:
         Return tuple(direction, distance) from start/goal
         """
 
+        # convert s to range [0., 1.]
         s = [i / 100 for i in s]
+        
         if ref == "goal":
             pos = self.goal_pos
         else:
@@ -186,16 +188,14 @@ class Model:
 #         env_params,
 #     )
 
+
 def make_env():
 
     import json
-    with open('content/pw1.json') as f:
+
+    with open("content/pw1.json") as f:
         env_params = json.load(f)
 
-    env = gym.make(
-            "PuddleWorld-v0",
-            render_mode="human",
-            **env_params
-        )
-    
+    env = gym.make("PuddleWorld-v0", render_mode="human", **env_params)
+
     return env, env_params

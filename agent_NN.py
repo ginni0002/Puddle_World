@@ -1,13 +1,21 @@
+import random
+import optuna.terminator
+import tensorflow as tf
+
+import gymnasium as gym
+import gym_puddle
+import matplotlib.pyplot as plt
+import numpy as np
+
+import numpy as np
+import matplotlib.pyplot as plt
+
 from datetime import datetime
 import os
-import joblib
-import random
-
-import tensorflow as tf
-import numpy as np
+import json
 import optuna
 
-from utils import PQueue
+from utils import PQueue, QNetwork
 from model import Model, make_env
 
 
@@ -34,7 +42,7 @@ class DynaQ:
         ]
 
         self.action_size = self.env.action_space.n
-        self.q = np.zeros(tuple(self.state_size) + (self.action_size,))
+        self.q_net = QNetwork(self.env.observation_space.shape, self.action_size)
         self.model = Model(
             self.grid_size, self.state_size, self.action_size, env_params, h_weight
         )
@@ -61,12 +69,6 @@ class DynaQ:
 
         self.summary_writer = summary_writer
         self.env_params = env_params
-        self.render = False
-    
-    def reset_env_params(self, env, env_params):
-        self.env = env
-        self.env_params = env_params
-        self.model.set_env_params(env_params)
 
     def learn(self):
         """Perform DynaQ learning, return cumulative return"""
@@ -83,14 +85,14 @@ class DynaQ:
                 a = self.env.action_space.sample()
             else:
                 # combine action scores and q values
-                q_values = self.q[tuple(s)]
+                q_values = self.q_net.predict(s)
                 action_scores = self.model.get_action_scores(s)
                 p_scores = q_values + action_scores
                 a = np.argmax(p_scores)
 
             # Take action, observe outcome
             s_prime, r, done, _, _ = self.env.step(a)
-            if self.render: self.env.render()
+            # self.env.render()
             s_prime = np.rint(s_prime * self.grid_size)
             s_prime = [int(i) for i in s_prime]
             unbounded, _ = self.model.get_action(s_prime)
@@ -110,7 +112,11 @@ class DynaQ:
                 self.trace_dict[trace_key] += 1
 
             # Q-Learning
-            update = r + self.gamma * np.max(self.q[tuple(s_prime)]) - self.q[idx]
+            update = (
+                r
+                + self.gamma * np.max(self.q_net.predict(s_prime))
+                - self.q_net.predict(s)
+            )
             if step == 1:
                 self.avg_update = update
             else:
@@ -144,9 +150,9 @@ class DynaQ:
             self.p_thresh_lower = sorted(
                 [
                     (
-                        1.0 + (len(self.p_queue) - self.n)
+                        1.0 + (self.n - len(self.p_queue))
                         if self.n < len(self.p_queue)
-                        else np.max(0.99 * self.p_thresh_lower, 0.0)
+                        else 1.0
                     ),
                     self.p_thresh_lower,
                     (1 - self.update_threshold) * abs(self.avg_update),
@@ -159,7 +165,6 @@ class DynaQ:
             cum_reward,
             step,
             (self.p_thresh_lower, abs(self.avg_update), self.p_thresh_upper),
-            len(self.p_queue),
         )
 
     def planning(self):
@@ -207,106 +212,3 @@ class DynaQ:
                         )
                         if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
                             self.p_queue.add((abs(update), (tuple(state), a_i)))
-
-def objective(trial: optuna.Trial):
-
-    try:
-        alpha = trial.suggest_float("alpha", 0.0001, 0.1, log=True)
-        gamma = trial.suggest_float("gamma", 0.5, 0.99)
-        epsilon = trial.suggest_float("epsilon", 0.1, 1.0, step=0.1)
-        lambd = trial.suggest_float("lambd", 0.1, 1.0, step=0.1)
-
-        planning_steps = 1000  # planning loop terminates if priority queue is empty
-        # h_weight = trial.suggest_float("h_weight", 0.1, 1.0, step=0.1)
-        h_weight = 0.5
-        env, env_params = make_env()
-
-        max_steps = 2000
-        max_episodes = 2000
-
-        log_folder = "samples"
-        summary_writer = tf.summary.create_file_writer(
-            os.path.join(
-                log_folder,
-                f"alpha-{alpha}."
-                + f"gamma-{gamma}."
-                + f"epsilon-{epsilon}."
-                + f"planning_steps-{planning_steps}."
-                + f"max_episodes-{max_episodes}"
-                + datetime.now().strftime("%Y%m%d-%H%M%S"),
-            )
-        )
-        dyna = DynaQ(
-            env,
-            planning_steps,
-            alpha,
-            gamma,
-            epsilon,
-            max_steps,
-            env_params,
-            summary_writer,
-            h_weight,
-            lambd,
-        )
-        cumulative_reward = 0.0
-        for i in range(1, max_episodes):
-
-            total_reward, num_steps, update_thresholds, queue_length = dyna.learn()
-            q_table = dyna.q
-            q_table = tf.reduce_mean(q_table, 2)
-            q_table = tf.divide(
-                tf.subtract(q_table, tf.reduce_min(q_table)),
-                tf.subtract(tf.reduce_max(q_table), tf.reduce_min(q_table)),
-            )
-            if i%10 == 0:
-                dyna.render = True
-            else:
-                dyna.render = False
-            q_table = tf.reshape(q_table, (1,) + q_table.shape + (1,))
-            with summary_writer.as_default(step=i):
-                tf.summary.scalar("Episodic Reward", total_reward)
-                tf.summary.image("Q_table", q_table)
-                tf.summary.scalar("Total Steps", num_steps)
-                tf.summary.scalar("Average Q", np.average(q_table))
-                tf.summary.scalar(
-                    "Update_threshold/lower", np.average(update_thresholds[0])
-                )
-                tf.summary.scalar(
-                    "Update_threshold/average_update", np.average(update_thresholds[1])
-                )
-                tf.summary.scalar(
-                    "Update_threshold/upper", np.average(update_thresholds[2])
-                )
-                tf.summary.scalar(
-                    "PQueue_length",
-                    queue_length,
-                )
-
-            print(
-                f"Episode: {i:4d} | Reward: {total_reward:6.2f} | Epsilon: {dyna.epsilon:4.2f} | Num-Steps: {num_steps:4d}"
-            )
-            cumulative_reward += total_reward
-            # env reset
-            dyna.reset_env_params(make_env())
-
-        env.close()
-        return cumulative_reward
-    except KeyboardInterrupt as e:
-        raise e
-
-
-if __name__ == "__main__":
-
-    log_folder = "samples"
-    if not os.path.exists(log_folder):
-        os.mkdir(log_folder)
-
-    study = optuna.create_study(
-        study_name="optuna_studies",
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(),
-    )
-    try:
-        study.optimize(objective, n_trials=500, show_progress_bar=True, n_jobs=1)
-    finally:
-        joblib.dump(study, "optuna_study.pkl")
