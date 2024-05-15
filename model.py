@@ -64,9 +64,8 @@ class Model:
         """
         s_ = list(self.transitions[idx].keys())
         indices = list(range(len(s_)))
-        counts = np.array(list(self.transitions[idx].values()))
+        counts = np.log(list(self.transitions[idx].values())) + 1e-3
         probs = counts / np.sum(counts)
-
         return s_[np.random.choice(indices, len(probs), replace=False, p=probs)[0]]
 
     def get_action(self, s, return_all=False):
@@ -131,71 +130,71 @@ class Model:
         return direction, dist
 
 
-# def make_env(prev_env=None):
+def make_env(prev_env=None):
 
-#     x_goal, y_goal = [random.uniform(0.05, 0.95) for _ in range(2)]
+    x_goal, y_goal = [random.uniform(0.05, 0.95) for _ in range(2)]
 
-#     x_start, y_start = (1 - x_goal, 1 - y_goal)
-#     env_params = {
-#         "start": [x_start, y_start],
-#         "goal": [x_goal, y_goal],
-#         "noise": np.random.uniform(0.0001, 0.001),
-#     }
-#     env = None
-#     if prev_env:
-#         # only change positions
-#         env = gym.make(
-#             "PuddleWorld-v0",
-#             render_mode="human",
-#             start=env_params["start"],
-#             goal=env_params["goal"],
-#             noise=env_params["noise"],
-#             puddle_top_left=prev_env.puddle_top_left,
-#             puddle_width=prev_env.puddle_width,
-#         )
+    x_start, y_start = (1 - x_goal, 1 - y_goal)
+    env_params = {
+        "start": [x_start, y_start],
+        "goal": [x_goal, y_goal],
+        "noise": np.random.uniform(0.0001, 0.001),
+    }
+    env = None
+    if prev_env:
+        # only change positions
+        env = gym.make(
+            "PuddleWorld-v0",
+            render_mode="human",
+            start=env_params["start"],
+            goal=env_params["goal"],
+            noise=env_params["noise"],
+            puddle_top_left=prev_env.puddle_top_left,
+            puddle_width=prev_env.puddle_width,
+        )
 
-#     else:
-#         num_puddles = int(random.uniform(3, 6))
-#         pos_range = list(np.arange(0.0, 1.0, 0.1))
-#         puddle_pos = []
-#         puddle_sizes = []
-#         for _ in range(num_puddles):
-#             puddle_pos.append(
-#                 [
-#                     random.choice(
-#                         [
-#                             i
-#                             for i in pos_range
-#                             if i not in env_params["goal"] + env_params["start"]
-#                         ]
-#                     )
-#                     for _ in range(2)
-#                 ]
-#             )
+    else:
+        num_puddles = int(random.uniform(3, 6))
+        pos_range = list(np.arange(0.0, 1.0, 0.1))
+        puddle_pos = []
+        puddle_sizes = []
+        for _ in range(num_puddles):
+            puddle_pos.append(
+                [
+                    random.choice(
+                        [
+                            i
+                            for i in pos_range
+                            if i not in env_params["goal"] + env_params["start"]
+                        ]
+                    )
+                    for _ in range(2)
+                ]
+            )
 
-#             puddle_sizes.append([random.uniform(0.05, 0.4) for _ in range(2)])
-#         env = gym.make(
-#             "PuddleWorld-v0",
-#             render_mode="human",
-#             start=env_params["start"],
-#             goal=env_params["goal"],
-#             noise=env_params["noise"],
-#             puddle_top_left=puddle_pos,
-#             puddle_width=puddle_sizes,
-#         )
-#     return (
-#         env,
-#         env_params,
-#     )
+            puddle_sizes.append([random.uniform(0.05, 0.4) for _ in range(2)])
+        env = gym.make(
+            "PuddleWorld-v0",
+            render_mode="human",
+            start=env_params["start"],
+            goal=env_params["goal"],
+            noise=env_params["noise"],
+            puddle_top_left=puddle_pos,
+            puddle_width=puddle_sizes,
+        )
+    return (
+        env,
+        env_params,
+    )
 
 
-def make_env():
+# def make_env():
 
-    import json
+#     import json
 
-    with open("content/pw1.json") as f:
-        env_params = json.load(f)
+#     with open("content/pw1.json") as f:
+#         env_params = json.load(f)
 
-    env = gym.make("PuddleWorld-v0", render_mode="human", **env_params)
+#     env = gym.make("PuddleWorld-v0", render_mode="human", **env_params)
 
-    return env, env_params
+#     return env, env_params
