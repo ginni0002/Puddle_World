@@ -1,13 +1,12 @@
 from datetime import datetime
 import os
 import joblib
-import random
 
 import tensorflow as tf
 import numpy as np
 import optuna
 
-from utils import PQueue
+from utils import PQueue, get_heatmap
 from model import Model, make_env
 
 
@@ -48,12 +47,12 @@ class DynaQ:
         # initial thresholds, will change as q values grow/shrink
         # upper threshold is fixed to prevent agent from just updating puddle interactions
         self.p_thresh_lower = 0.01
-        self.p_thresh_upper = 40
+        self.p_thresh_upper = 20
         self.update_threshold = 0.25
         self.avg_update = 0.0
 
         self.epsilon = epsilon
-        self.epsilon_decay_rate = 0.995
+        self.epsilon_decay_rate = 0.99
         self.min_epsilon = 0.01
         self.n = n
         self.max_steps = max_steps
@@ -68,6 +67,26 @@ class DynaQ:
         self.env = env
         self.env_params = env_params
         self.model.set_env_params(env_params)
+
+    def set_update_threshold(self):
+
+        # Update PQueue thresholds
+        self.p_thresh_lower = sorted(
+            [
+                (
+                    self.p_thresh_lower * 1.05
+                    if self.n < len(self.p_queue)
+                    else np.max([0.95 * self.p_thresh_lower, 0.01])
+                ),
+                self.p_thresh_lower,
+                (1 - self.update_threshold) * abs(self.avg_update),
+            ]
+        )[1]
+
+    def update_q(self, r, idx, s_prime):
+        update = r + self.gamma * np.max(self.q[tuple(s_prime)]) - self.q[idx]
+        update = 0.05 * update + 0.95 * self.avg_update
+        return update
 
     def learn(self):
         """Perform DynaQ learning, return cumulative return"""
@@ -92,8 +111,8 @@ class DynaQ:
 
             # Take action
             s_prime, r, done, _, _ = self.env.step(a)
-            if self.render:
-                self.env.render()
+            # if self.render:
+            #     self.env.render()
             s_prime = np.rint(s_prime * self.grid_size)
             s_prime = [int(i) for i in s_prime]
             unbounded, _ = self.model.get_action(s_prime)
@@ -113,17 +132,11 @@ class DynaQ:
                 self.trace_dict[trace_key] += 1
 
             # Q-value update
-            update = -10.0 if unbounded else 0.0
-            update += r + self.gamma * np.max(self.q[tuple(s_prime)]) - self.q[idx]
-            if step == 1:
-                self.avg_update = update
-            else:
-                self.avg_update = 0.05 * update + 0.95 * self.avg_update
-
+            update = self.update_q(r, idx, s_prime)
             self.q[idx] += self.alpha * self.trace_dict[trace_key] * update
 
             # Check if update > theta, if yes: push to PQueue
-            if self.p_thresh_upper >= abs(update) >= self.p_thresh_lower:
+            if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
                 self.p_queue.add((abs(update), (tuple(s), a)))
 
             # Learn model
@@ -143,17 +156,7 @@ class DynaQ:
             # Update the trace
             self.trace_dict[trace_key] *= self.gamma * self.lambd
             # Update PQueue thresholds
-            self.p_thresh_lower = sorted(
-                [
-                    (
-                        self.p_thresh_lower * 1.05
-                        if self.n < len(self.p_queue)
-                        else np.max([0.95 * self.p_thresh_lower, 0.01])
-                    ),
-                    self.p_thresh_lower,
-                    (1 - self.update_threshold) * abs(self.avg_update),
-                ]
-            )[1]
+            self.set_update_threshold()
 
         # update epsilon
         self.epsilon = max(self.epsilon * self.epsilon_decay_rate, self.min_epsilon)
@@ -172,46 +175,44 @@ class DynaQ:
                 break
             # get random state and action in that state
             s, a = self.p_queue.pop()
-            self.visits[tuple(s)] += 1
             s_prime, r = self.model.step(s, a)
             idx = tuple(s + [a])
-            unbounded, _ = self.model.get_action(s)
-            update = -10.0 if unbounded else 0.0
-            update += r + self.gamma * np.max(self.q[tuple(s_prime)]) - self.q[idx]
+            update = self.update_q(r, idx, s_prime)
             self.q[idx] += self.alpha * (update)
 
             # pick all neighbors of s, check their TD error and add to PQueue if > threshold
             _, actions = self.model.get_action(s, return_all=True)
             # cannot loop over all adjacent states as it can lead to an infinite back and forth between two states.
-            actions = random.choice(actions)
             # backtrack s_bar from state with actions
-            states = []
-            idx = tuple(np.concatenate([s, [actions]]))
-            idx = hash(idx)
-            if idx in self.model.transitions:
-                states.append(self.model.sample_s_prime(idx))
+            for action in actions:
+                idx = tuple(np.concatenate([s, [action]]))
+                idx = hash(idx)
+                if idx not in self.model.transitions:
+                    continue
 
-            if not states:
-                break
+                state = self.model.sample_s_prime(idx)
 
-            for state in states:
                 _, actions = self.model.get_action(state, return_all=True)
                 for a_i in actions:
                     idx = tuple(np.concatenate([state, [a_i]]))
                     if hash(idx) in self.model.transitions:
                         r_bar = self.model.rewards[hash(idx)]
-                        update = abs(
+                        update = (
                             r_bar + self.gamma * np.max(self.q[tuple(s)]) - self.q[idx]
                         )
+
                         if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
                             self.p_queue.add((abs(update), (tuple(state), a_i)))
+                            self.visits[tuple(state)] += 1
+
+            self.set_update_threshold()
 
 
 def objective(trial: optuna.Trial):
 
     try:
-        alpha = 0.09 # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
-        gamma = 0.7 # trial.suggest_float("gamma", 0.5, 0.99)
+        alpha = 0.09  # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
+        gamma = 0.7  # trial.suggest_float("gamma", 0.5, 0.99)
         # epsilon = trial.suggest_float("epsilon", 0.5, 1.0, step=0.1)
         lambd = trial.suggest_float("lambd", 0.1, 0.9, step=0.1)
         epsilon = 1.0
@@ -220,7 +221,7 @@ def objective(trial: optuna.Trial):
         env, env_params = make_env()
 
         max_steps = 1000
-        max_episodes = 100
+        max_episodes = 500
 
         log_folder = "samples"
         summary_writer = tf.summary.create_file_writer(
@@ -230,6 +231,7 @@ def objective(trial: optuna.Trial):
                 + f"gamma-{gamma}."
                 + f"epsilon-{epsilon}."
                 + f"lambda-{lambd}."
+                + f"h_weight-{h_weight}."
                 + datetime.now().strftime("%Y%m%d-%H%M%S"),
             )
         )
@@ -251,28 +253,19 @@ def objective(trial: optuna.Trial):
             total_reward, num_steps, update_thresholds, queue_length, visits = (
                 dyna.learn()
             )
-            q_table = dyna.q
-            q_table = tf.cast(tf.reduce_mean(q_table, 2), tf.float32)
-            q_table = tf.divide(
-                tf.subtract(q_table, tf.reduce_min(q_table)),
-                tf.subtract(tf.reduce_max(q_table), tf.reduce_min(q_table)),
-            )
-            visits = tf.cast(visits, tf.float32)
-            visits = tf.divide(visits, tf.reduce_max(visits))
+            q_table = get_heatmap(dyna.q)
+            visits = get_heatmap(visits)
             if i % 10 == 0:
                 dyna.render = True
             else:
                 dyna.render = False
-
-            q_table = tf.reshape(q_table, (1,) + q_table.shape + (1,))
-            visits = tf.reshape(visits, (1,) + visits.shape + (1,))
 
             with summary_writer.as_default(step=i):
                 tf.summary.scalar("Episodic Reward", total_reward)
                 tf.summary.image("Q_table", q_table)
                 tf.summary.image("Visits", visits)
                 tf.summary.scalar("Total Steps", num_steps)
-                tf.summary.scalar("Average Q", np.average(q_table))
+                tf.summary.scalar("Average Q", np.average(dyna.q))
                 tf.summary.scalar(
                     "Update_threshold/lower", np.average(update_thresholds[0])
                 )
@@ -319,3 +312,4 @@ if __name__ == "__main__":
         study.optimize(objective, n_trials=100, show_progress_bar=True, n_jobs=1)
     finally:
         joblib.dump(study, "optuna_study.pkl")
+hash

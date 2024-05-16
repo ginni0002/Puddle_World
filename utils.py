@@ -1,13 +1,14 @@
 import heapq
 from collections import deque
-import os
-# Keep using keras-2 (tf-keras) rather than keras-3 (keras).
 
 import numpy as np
-import keras
 import tensorflow as tf
 from tf_agents.replay_buffers import py_uniform_replay_buffer
 from tf_agents.specs import tensor_spec
+
+import seaborn as sns
+import io
+import matplotlib.pyplot as plt
 
 
 class PQueue:
@@ -68,7 +69,7 @@ class QNetwork:
 
     def __init__(
         self,
-        input_dims: tuple,
+        input_dims: int,
         output_dims: int,
         lr: float = 0.001,
         gamma: float = 0.99,
@@ -108,8 +109,9 @@ class QNetwork:
                 "next_state",
             ),
         )
+        self.spec_shapes = [i.shape for i in self.data_spec]
         self.replay_buffer = py_uniform_replay_buffer.PyUniformReplayBuffer(
-            tensor_spec.to_array_spec(self.data_spec),
+            data_spec=tensor_spec.to_array_spec(self.data_spec),
             capacity=buffer_length * self.batch_size,
         )
         self.temp_buffer = deque()
@@ -130,7 +132,7 @@ class QNetwork:
 
     def collect_rollout(self, sars: tuple):
 
-        tf.ensure_shape(sars, self.data_spec)
+        assert all([i.is_compatible_with(tf.shape(j)) for i, j in zip(self.spec_shapes, sars)])
         self.temp_buffer.append(sars)
         if len(self.temp_buffer) == self.batch_size:
             # add batch dim to items and append to replay buffer
@@ -142,8 +144,10 @@ class QNetwork:
 
     def predict(self, state):
 
-        tf.ensure_shape(state, self.data_spec[0])
-        return self.model.predict(state)
+        tf.ensure_shape(state, self.data_spec[0].shape)
+        # convert state to batch
+        state = tf.expand_dims(state, 0)
+        return self.model.predict(state, batch_size=None)
 
     def learn(self):
         """
@@ -165,3 +169,58 @@ class QNetwork:
         grads = tf.gradients(loss, self.model.trainable_weights)
         grads = self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
         return grads
+
+
+def get_heatmap(matrix):
+    """
+    Plots 2-D matrix as a heatmap
+    Returns: matplotlib.ax object
+    """
+
+    mat_dims = tf.shape(matrix)
+    if len(mat_dims) > 2:
+        # print("Warning: Matrix rank > 2 provided, last (n-2) dims reduced")
+        # reduce last n-2 dims
+        matrix = tf.reduce_mean(matrix, axis=[range(-len(mat_dims) + 2, 0)])
+
+    vmin = tf.reduce_min(matrix)
+    vmax = tf.reduce_max(matrix)
+    hmap = sns.heatmap(matrix, vmin=vmin, vmax=vmax)
+
+    # Save the plot to a PNG in memory.
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    # Closing the figure prevents it from being displayed directly inside
+    # the notebook.
+    plt.close(hmap.get_figure())
+    buf.seek(0)
+    # Convert PNG buffer to TF image
+    image = tf.image.decode_png(buf.getvalue(), channels=4)
+    # Add the batch dimension
+    image = tf.expand_dims(image, 0)
+    return image
+
+
+if __name__ == "__main__":
+
+    num_ep = 100
+    s = (0.0, 1.0)
+
+    from model import Model, make_env
+
+    env, env_params = make_env()
+    grid_size = 40
+    state_size = [
+        int(i)
+        for i in (env.observation_space.high - env.observation_space.low) * grid_size
+    ]
+    q_net = QNetwork(2, 4)
+    model = Model(grid_size, state_size, 4, env_params, 0.5)
+    env.reset()
+    for _ in range(num_ep):
+
+        a = q_net.predict(s)
+        a = np.argmax(a)
+        s_, r, _, _, _ = env.step(a)
+        q_net.collect_rollout((s, a, r, s_))
+        print(q_net.temp_buffer, q_net.replay_buffer.num_frames())
