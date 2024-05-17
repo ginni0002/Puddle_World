@@ -1,14 +1,47 @@
 from datetime import datetime
 import os
 import joblib
+import time
 
 import tensorflow as tf
 import numpy as np
 import optuna
+import jax
+import jax.numpy as jnp
+from jax import jit
 
 from utils import PQueue, get_heatmap
-from model import Model, make_env
+from model import ModelTabular, make_env
 
+"""
+    Static Helper functions for jax-jit 
+"""
+
+
+@jit
+def set_update_threshold_static(th_low, n, len_p_queue, avg_update, th_update):
+
+    # if alpha near 0, n > len_p_queue and vice versa
+    alpha = jax.nn.sigmoid(jnp.float32(len_p_queue - n))
+    th_new = alpha * th_low * 1.05 + (1 - alpha) * jnp.max(
+        jnp.array([0.95 * th_low, 0.01])
+    )
+    return jnp.sort(
+        jnp.array(
+            [
+                th_new,
+                th_low,
+                (1 - th_update) * abs(avg_update),
+            ]
+        )
+    )[1]
+
+@jit
+def update_q_static(r, q, q_max, gamma, avg_update):
+    update = r + gamma * q_max - q
+    avg_update = 0.05 * update + 0.95 * avg_update
+    return update, avg_update
+    
 
 class DynaQ:
     def __init__(
@@ -34,7 +67,7 @@ class DynaQ:
 
         self.action_size = self.env.action_space.n
         self.q = np.zeros(tuple(self.state_size) + (self.action_size,))
-        self.model = Model(
+        self.model = ModelTabular(
             self.grid_size, self.state_size, self.action_size, env_params, h_weight
         )
         self.visits = np.zeros(tuple(self.state_size))
@@ -71,22 +104,19 @@ class DynaQ:
     def set_update_threshold(self):
 
         # Update PQueue thresholds
-        self.p_thresh_lower = sorted(
-            [
-                (
-                    self.p_thresh_lower * 1.05
-                    if self.n < len(self.p_queue)
-                    else np.max([0.95 * self.p_thresh_lower, 0.01])
-                ),
-                self.p_thresh_lower,
-                (1 - self.update_threshold) * abs(self.avg_update),
-            ]
-        )[1]
+        self.p_thresh_lower = set_update_threshold_static(
+            self.p_thresh_lower,
+            self.n,
+            len(self.p_queue),
+            self.avg_update,
+            self.update_threshold,
+        )
 
     def update_q(self, r, idx, s_prime):
-        update = r + self.gamma * np.max(self.q[tuple(s_prime)]) - self.q[idx]
-        update = 0.05 * update + 0.95 * self.avg_update
-        return update
+        q_max = jnp.max(self.q[tuple(s_prime)])
+        q_val = self.q[idx]
+        update, avg_update = update_q_static(r, q_val, q_max, self.gamma, self.avg_update)
+        return np.asarray(update), np.asarray(avg_update)
 
     def learn(self):
         """Perform DynaQ learning, return cumulative return"""
@@ -132,7 +162,8 @@ class DynaQ:
                 self.trace_dict[trace_key] += 1
 
             # Q-value update
-            update = self.update_q(r, idx, s_prime)
+            update, avg_update = self.update_q(r, idx, s_prime)
+            self.avg_update = avg_update
             self.q[idx] += self.alpha * self.trace_dict[trace_key] * update
 
             # Check if update > theta, if yes: push to PQueue
@@ -169,48 +200,59 @@ class DynaQ:
         )
 
     def planning(self):
-
+        # t1 = time.time()
         for _ in range(self.n):
+            
             if not len(self.p_queue):
                 break
             # get random state and action in that state
             s, a = self.p_queue.pop()
             s_prime, r = self.model.step(s, a)
-            idx = tuple(s + [a])
-            update = self.update_q(r, idx, s_prime)
+            idx = tuple([*s + [a]])
+            update, avg_update = self.update_q(r, idx, s_prime)
+            self.avg_update = avg_update
             self.q[idx] += self.alpha * (update)
 
             # pick all neighbors of s, check their TD error and add to PQueue if > threshold
-            _, actions = self.model.get_action(s, return_all=True)
+            _, action = self.model.get_action(s)
             # cannot loop over all adjacent states as it can lead to an infinite back and forth between two states.
             # backtrack s_bar from state with actions
-            for action in actions:
-                idx = tuple(np.concatenate([s, [action]]))
-                idx = hash(idx)
-                if idx not in self.model.transitions:
-                    continue
-
+            
+            idx = tuple(([*s, action]))
+            idx = hash(idx)
+            if idx in self.model.transitions:
                 state = self.model.sample_s_prime(idx)
+            else:
+                continue
 
-                _, actions = self.model.get_action(state, return_all=True)
-                for a_i in actions:
-                    idx = tuple(np.concatenate([state, [a_i]]))
-                    if hash(idx) in self.model.transitions:
-                        r_bar = self.model.rewards[hash(idx)]
-                        update = (
-                            r_bar + self.gamma * np.max(self.q[tuple(s)]) - self.q[idx]
-                        )
+            # # pick random state instead
+            # h_idx = np.random.choice(self.model.hash_list)
+            # state = self.model.sample_s_prime(h_idx)
 
-                        if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                            self.p_queue.add((abs(update), (tuple(state), a_i)))
-                            self.visits[tuple(state)] += 1
+            _, actions = self.model.get_action(state, return_all=True)
+            for a_i in actions:
+                idx = tuple([*state, a_i])
+                h_idx = hash(idx)
+                if h_idx in self.model.transitions:
+                    r_bar = self.model.rewards[h_idx]
+                    update, _ = self.update_q(r_bar, idx, s)
+                    if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
+                        self.p_queue.add((abs(update), (tuple(state), a_i)))
+                        # self.visits[tuple(state)] += 1
 
             self.set_update_threshold()
+        # print(time.time() - t1, self.p_thresh_lower, len(self.p_queue))
 
 
 def objective(trial: optuna.Trial):
-
+    
     try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            tf.config.set_logical_device_configuration(
+                gpus[0], [tf.config.LogicalDeviceConfiguration(memory_limit=512)]
+            )
+
         alpha = 0.09  # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
         gamma = 0.7  # trial.suggest_float("gamma", 0.5, 0.99)
         # epsilon = trial.suggest_float("epsilon", 0.5, 1.0, step=0.1)
@@ -249,7 +291,6 @@ def objective(trial: optuna.Trial):
         )
         cumulative_reward = 0.0
         for i in range(1, max_episodes):
-
             total_reward, num_steps, update_thresholds, queue_length, visits = (
                 dyna.learn()
             )
@@ -312,4 +353,3 @@ if __name__ == "__main__":
         study.optimize(objective, n_trials=100, show_progress_bar=True, n_jobs=1)
     finally:
         joblib.dump(study, "optuna_study.pkl")
-hash

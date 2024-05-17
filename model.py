@@ -1,19 +1,44 @@
-import numpy as np
 import random
+import time
 
 import gym_puddle
 import gymnasium as gym
 
 
-class Model:
-    def __init__(self, grid_size, n_states, n_actions, env_params, h_weight):
+import tensorflow as tf
+import numpy as np
 
-        # transitions[(s, a)] = {s_: n_occurences}
-        self.transitions = {}
-        self.rewards = {}
+
+class BaseModel:
+
+    def __init__(self, n_states, n_actions, env_params):
         self.n_states = n_states
         self.n_actions = n_actions
         self.state_dims = len(self.n_states)
+        self.set_env_params(env_params)
+
+    def set_env_params(self, env_params):
+        self.start_pos = env_params["start"]
+        self.goal_pos = env_params["goal"]
+        self.noise = env_params["noise"]
+
+    def step(self, s, a):
+        raise NotImplementedError
+
+    def get_action(self, s, return_all=False):
+        raise NotImplementedError
+
+    def get_action_scores(self, s):
+        raise NotImplementedError
+
+
+class ModelTabular(BaseModel):
+    def __init__(self, grid_size, n_states, n_actions, env_params, h_weight):
+
+        super().__init__(n_states, n_actions, env_params)
+        # transitions[(s, a)] = {s_: n_occurences}
+        self.transitions = {}
+        self.rewards = {}
         self.grid_size = grid_size
         self.hash_list = []
         self.set_env_params(env_params)
@@ -46,6 +71,7 @@ class Model:
 
     def step(self, s, a):
         """Return next_state and reward for state-action pair"""
+
         idx = tuple(np.concatenate([s, [a]]))
         idx = hash(idx)
 
@@ -56,6 +82,7 @@ class Model:
         # pick next state based on sampling distribution
         s_prime = self.sample_s_prime(idx)
         r = self.rewards[idx]
+
         return list(s_prime), r
 
     def sample_s_prime(self, idx):
@@ -72,6 +99,7 @@ class Model:
         """
         Return bounded action(s) for state s
         """
+
         x, y = s
         unbounded = False
         if x == 0 or x >= self.grid_size - 1:
@@ -113,7 +141,7 @@ class Model:
 
         # convert s to range [0., 1.]
         s = [i / 100 for i in s]
-        
+
         if ref == "goal":
             pos = self.goal_pos
         else:
@@ -130,8 +158,75 @@ class Model:
         return direction, dist
 
 
-def make_env(prev_env=None):
+class TransitionModelNN(BaseModel):
 
+    def __init__(self, n_states, n_actions, env_params, h_weight):
+        super().__init__(n_states, n_actions, env_params)
+
+        self.h_weight = h_weight
+        self.batch_size = 32
+        self.dims = [128, 128]
+        self.lr = 1e-3
+        self.model = self._build_model()
+        self.opt = tf.keras.optimizers.Adam(self.lr)
+        self.loss = tf.keras.losses.MeanSquaredError()
+
+    def _build_model(self):
+
+        state = tf.keras.layers.Input(
+            shape=self.n_states,
+            batch_size=self.batch_size,
+        )
+        action = tf.keras.layers.Input(
+            shape=self.n_actions,
+            batch_size=self.batch_size,
+        )
+        x = tf.keras.layers.concatenate([state, action], axis=1)
+        for dim in self.dims:
+            x = tf.keras.layers.Dense(dim, activation=tf.nn.relu)(x)
+
+        next_state = tf.keras.layers.Dense(self.n_states)(x)
+        reward = tf.keras.layers.Dense(1)(x)
+        return tf.keras.Model(inputs=[state, action], outputs=[next_state, reward])
+
+    @tf.function(
+        input_signature=(
+            tf.TensorSpec([None, 1], dtype=tf.float32),
+            tf.TensorSpec([None, 1], dtype=tf.float32),
+        )
+    )
+    def predict(self, state, action):
+        """
+        Predict next state and reward
+        """
+        return self.model([state, action])
+
+    @tf.function
+    def learn(self, sars_):
+        """
+        Retrieve sars' batches from QNet replay buffer (reuse) and train model
+        based on transition history
+        """
+
+        # compute Q-targets and current Q values, get loss from TD error
+        # take gradient over batch
+        s, a, r, s_ = tf.unstack(tf.stop_gradient(sars_), axis=1)
+        a, _ = tf.unstack(tf.cast(a, tf.int32), axis=1)
+        r, _ = tf.unstack(r, axis=1)
+
+        with tf.GradientTape() as tape:
+            next_state_predict, reward_predict = self.model([s, a])
+            loss = self.loss(s_ - next_state_predict) + self.loss(r - reward_predict)
+
+        grads = tape.gradient(loss, self.model.trainable_weights)
+        self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
+
+
+def make_env(prev_env=None):
+    """
+    Make puddle-world env with random initialization
+    limited to randomizing position if previous env provided
+    """
     x_goal, y_goal = [random.uniform(0.05, 0.95) for _ in range(2)]
 
     x_start, y_start = (1 - x_goal, 1 - y_goal)
@@ -143,23 +238,16 @@ def make_env(prev_env=None):
     env = None
     if prev_env:
         # only change positions
-        env = gym.make(
-            "PuddleWorld-v0",
-            render_mode="human",
-            start=env_params["start"],
-            goal=env_params["goal"],
-            noise=env_params["noise"],
-            puddle_top_left=prev_env.puddle_top_left,
-            puddle_width=prev_env.puddle_width,
-        )
+        puddle_top_left = prev_env["puddle_top_left"]
+        puddle_width = prev_env["puddle_width"]
 
     else:
         num_puddles = int(random.uniform(3, 6))
         pos_range = list(np.arange(0.0, 1.0, 0.1))
-        puddle_pos = []
-        puddle_sizes = []
+        puddle_top_left = []
+        puddle_width = []
         for _ in range(num_puddles):
-            puddle_pos.append(
+            puddle_top_left.append(
                 [
                     random.choice(
                         [
@@ -172,16 +260,17 @@ def make_env(prev_env=None):
                 ]
             )
 
-            puddle_sizes.append([random.uniform(0.05, 0.4) for _ in range(2)])
-        env = gym.make(
-            "PuddleWorld-v0",
-            render_mode="human",
-            start=env_params["start"],
-            goal=env_params["goal"],
-            noise=env_params["noise"],
-            puddle_top_left=puddle_pos,
-            puddle_width=puddle_sizes,
-        )
+            puddle_width.append([random.uniform(0.05, 0.4) for _ in range(2)])
+
+    env = gym.make(
+        "PuddleWorld-v0",
+        render_mode="human",
+        start=env_params["start"],
+        goal=env_params["goal"],
+        noise=env_params["noise"],
+        puddle_top_left=puddle_top_left,
+        puddle_width=puddle_width,
+    )
     return (
         env,
         env_params,
