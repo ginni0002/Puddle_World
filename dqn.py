@@ -1,6 +1,5 @@
 import tensorflow as tf
-from collections import deque
-
+from utils import ReplayBuffer
 
 class QNetwork:
 
@@ -34,43 +33,36 @@ class QNetwork:
                 tf.float32,
                 "state",
             ),
-            tf.TensorSpec([input_dims, 1], tf.float32, "action"),
-            tf.TensorSpec([input_dims, 1], tf.float32, "reward"),
+            tf.TensorSpec([], tf.float32, "action"),
+            tf.TensorSpec([], tf.float32, "reward"),
             tf.TensorSpec(
                 [input_dims, 1],
                 tf.float32,
                 "next_state",
             ),
         )
-        self.spec_shapes = [i.shape for i in self.data_spec]
-        self.replay_buffer = deque(maxlen=buffer_length)
+        self.replay_buffer = ReplayBuffer(buffer_length, self.data_spec)
 
     def _build_model(self):
 
         inp = tf.keras.layers.Input(
-            shape=self.input_dims,
-            batch_size=self.batch_size,
+            shape=(self.input_dims,1),
+            # batch_size=self.batch_size,
         )
         x = inp
         for dim in self.dims:
             x = tf.keras.layers.Dense(dim, activation=tf.nn.relu)(x)
 
+        x = tf.keras.layers.Flatten(name="flatten")(x)
         out = tf.keras.layers.Dense(self.n_output)(x)
-        return tf.keras.Model(inputs=[inp], outputs=[out])
+        return tf.keras.Model(inputs=inp, outputs=out)
 
     def collect_rollout(self, sars: tuple):
         """
         Collect samples for the replay buffer for batch updates
         """
-        try:
-            sars = tf.keras.utils.pad_sequences(sars, dtype="float32")
-            sars = tf.expand_dims(sars, -1)
-        except ValueError:
-            print(f"Invalid (s, a, r, s') tuple: {sars}")
-            print(f"Valid shapes: {self.spec_shapes}")
-            raise
-
-        self.replay_buffer.append(sars)
+        sars = [tf.cast(i, tf.float32) for i in sars]
+        self.replay_buffer.collect_rollout(sars)
 
     @tf.function(input_signature=(tf.TensorSpec([None, 1], dtype=tf.float32),))
     def predict(self, state):
@@ -78,31 +70,31 @@ class QNetwork:
         Predict Q values of all actions given state
         """
         # convert state to batch
-        state = tf.expand_dims(state, 0)
-        return self.model(state)
+        # state = tf.expand_dims(state, 0)
+        state = [tf.reshape(state, (1, self.input_dims))]
+        return tf.squeeze(self.model(state))
 
     @tf.function
     def learn(self):
         """
         Update QNetwork parameters given replay mini-batch
         """
-        indices = tf.random.uniform(
-            (self.batch_size,), 0, len(self.replay_buffer), dtype=tf.int32
-        )
-        sample = tf.gather(tf.identity(list(self.replay_buffer)), indices)
+        sample = self.replay_buffer.get_random_samples()
         # compute Q-targets and current Q values, get loss from TD error
         # take gradient over batch
-        s, a, r, s_ = tf.unstack(tf.stop_gradient(sample), axis=1)
+        sample = tf.squeeze(tf.stop_gradient(sample))
+        s, a, r, s_ = tf.unstack(sample, axis=1)
         a, _ = tf.unstack(tf.cast(a, tf.int32), axis=1)
         r, _ = tf.unstack(r, axis=1)
+        r = tf.expand_dims(r, -1)
         with tf.GradientTape() as tape:
             q_target = r + self.gamma * tf.reduce_max(self.model(s_), 1, keepdims=True)
 
             action_values = self.model(s)
-            q_current = tf.gather_nd(action_values, a, batch_dims=1)
+            q_current = tf.gather(action_values, a, axis=1, batch_dims=1)
             loss = self.loss(q_target, q_current)
             td_error = q_target - q_current
-            
+        
         grads = tape.gradient(loss, self.model.trainable_weights)
         grads = self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
         return grads, td_error

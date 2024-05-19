@@ -1,6 +1,7 @@
 import heapq
 import time
 import io
+from collections import deque
 
 import numpy as np
 import tensorflow as tf
@@ -10,11 +11,12 @@ import matplotlib.pyplot as plt
 
 class PQueue:
 
-    def __init__(self):
+    def __init__(self, maxlen=100):
         self._queue = []
 
         # {content: priority}
         self._entries = {}
+        self.maxlen = maxlen
 
     def __len__(self):
         return len(self._queue)
@@ -35,18 +37,30 @@ class PQueue:
         priority = -abs(priority)
         if content in self._entries:
             if priority < self._entries[content]:
-                t1 = time.time()
                 item = tuple([priority, content])
                 arr = np.array(self._queue, dtype=object)[:, 1]
-                arr = np.array([hash(i) for i in arr])
-                idx = int(np.squeeze(np.where(arr == hash(content))))
+                idx = np.array(list(map(lambda elem: elem == content, arr)))
+                idx = np.squeeze(np.where(np.squeeze(idx)))[()]
                 self._queue[idx] = item
                 self._entries[content] = priority
-                print(time.time() - t1)
         else:
             # insert item in heap and hashmap
-            heapq.heappush(self._queue, tuple([priority, content]))
-            self._entries[content] = priority
+
+            # check if heap is filled
+            # compare last element of heap if full and replace/keep last element.
+            if len(self._queue) == self.maxlen:
+                p_last, c_last = self._queue[-1]
+                if priority < p_last: 
+                    self._queue[-1] = tuple([priority, content])
+                    self._entries[content] = priority
+
+                    # remove previous entry
+                    self._entries.pop(c_last)
+
+            else:
+                heapq.heappush(self._queue, tuple([priority, content]))
+                self._entries[content] = priority
+
 
     def pop(self):
         """
@@ -60,6 +74,68 @@ class PQueue:
                 if isinstance(i, tuple):
                     item[idx] = list(i)
             return item
+
+
+class ReplayBuffer:
+    def __init__(self, maxlen=10000, sample_spec=None):
+
+        self.maxlen = maxlen
+        self.replay_buffer = deque([], maxlen)
+
+        # both model and dqn use same input spec
+        # TODO: replace hardcoded input spec
+        input_dims = 2
+
+        if not sample_spec:
+            self.sample_spec = (
+                tf.TensorSpec(
+                    [input_dims, 1],
+                    tf.float32,
+                    "state",
+                ),
+                tf.TensorSpec([], tf.int64, "action"),
+                tf.TensorSpec([], tf.float32, "reward"),
+                tf.TensorSpec(
+                    [input_dims, 1],
+                    tf.float32,
+                    "next_state",
+                ),
+            )
+        else:
+            self.sample_spec = sample_spec
+
+        self.spec_shapes = [i.shape.as_list() for i in self.sample_spec]
+
+    def __len__(self):
+        return len(self.replay_buffer)
+
+    def as_list(self):
+        return list(self.replay_buffer)
+
+    def collect_rollout(self, sample):
+        """
+        Collect samples for the replay buffer for batch updates
+        """
+        try:
+            sample = [tf.broadcast_to(i, max(self.spec_shapes)) for i in sample]
+            sample = tf.expand_dims(sample, -1)
+        except ValueError:
+            print(f"Invalid (s, a, r, s') tuple: {sample}")
+            print(f"Valid shapes: {self.spec_shapes}")
+            raise
+
+        self.replay_buffer.append(sample)
+
+    @tf.function
+    def get_random_samples(self, batch_size=32):
+        """
+        Generates a batch of indices from a uniform distribution
+        """
+
+        indices = tf.random.uniform(
+            (batch_size,), 0, len(self.replay_buffer), dtype=tf.int32
+        )
+        return tf.gather(tf.identity(list(self.replay_buffer)), indices)
 
 
 def get_heatmap(matrix):

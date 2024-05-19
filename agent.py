@@ -171,7 +171,7 @@ class DynaQ:
                 self.p_queue.add((abs(update), (tuple(s), a)))
 
             # Learn model
-            self.model.add(s, a, s_prime, r)
+            self.model.add(s, a, r, s_prime)
 
             # Planning for n steps
             self.planning()

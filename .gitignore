@@ -1,3 +1,4 @@
 content/*
 samples/*
+optuna_study*
 __pycache__
