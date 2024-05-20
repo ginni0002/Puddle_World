@@ -20,7 +20,8 @@ class BaseModel:
         self.set_env_params(env_params)
 
         self.action_map = {"x": {-1: 0, 0: -1, 1: 1}, "y": {-1: 2, 0: -1, 1: 3}}
-        self.inverse_action = {0: 1, 1: 0, 2: 3, 3: 2}
+        self.inv_action_keys = tf.range(0, self.n_actions, dtype=tf.int64)
+        self.inv_action_values = tf.constant([1, 0, 3, 2], tf.int64)
         self.h_weight = h_weight
 
     def set_env_params(self, env_params):
@@ -70,9 +71,6 @@ class BaseModel:
         return action_scores
 
     def step(self, s, a):
-        raise NotImplementedError
-
-    def add(self, s, a, r, s_prime):
         raise NotImplementedError
 
 
@@ -162,7 +160,7 @@ class ModelTabular(BaseModel):
 
 class TransitionModelNN(BaseModel):
 
-    def __init__(self, n_states, state_size, n_actions, env_params, h_weight):
+    def __init__(self, n_states, state_size, n_actions, env_params, h_weight, input_spec):
         super().__init__(n_states, state_size, n_actions, env_params, h_weight)
 
         self.batch_size = 32
@@ -172,7 +170,8 @@ class TransitionModelNN(BaseModel):
         self.opt = tf.keras.optimizers.Adam(self.lr)
         self.loss = tf.keras.losses.MeanSquaredError()
 
-        self.buffer = ReplayBuffer()
+        self.spec_shapes = input_spec
+        self.replay_buffer = ReplayBuffer(input_spec)
         self.a = tf.range(0, self.n_actions, dtype=tf.int32)
 
     def _build_model(self):
@@ -203,7 +202,20 @@ class TransitionModelNN(BaseModel):
     def featurize(self, x):
         return x
 
-    @tf.function
+    @tf.function(
+        input_signature=(
+            tf.TensorSpec(
+                [
+                    None,
+                ]
+            ),
+            tf.TensorSpec(
+                [
+                    None,
+                ]
+            ),
+        )
+    )
     def _get_bounded_state(self, dim, s_dim):
         if not tf.searchsorted(dim, s_dim)[0] == 1:
             # revert s_prime to nearest boundary
@@ -214,7 +226,7 @@ class TransitionModelNN(BaseModel):
         input_signature=(
             tf.TensorSpec([None, 1], dtype=tf.float32),
             tf.TensorSpec([], dtype=tf.int64),
-        )
+        ),
     )
     def step(self, s, a):
         """
@@ -229,34 +241,41 @@ class TransitionModelNN(BaseModel):
         r = tf.squeeze(res["reward"])
         state_dims = tf.cast(self.state_size, tf.float32)
         s_prime = tf.vectorized_map(
-            lambda x: self._get_bounded_state(x[0], x[1]),
-            (state_dims, s_prime),
-            # fn_output_signature=tf.TensorSpec((1,), dtype=tf.float32)
+            lambda x: self._get_bounded_state(x[0], x[1]), (state_dims, s_prime)
         )
 
         s_prime = tf.reshape(s_prime, tf.shape(s))
         return s_prime, r
 
-    def add(self, s, a, r, s_prime):
-        sample = (s, a, r, s_prime)
-        sample = [tf.cast(i, tf.float32) for i in sample]
-        self.buffer.collect_rollout(sample)
-
+    @tf.function(
+        input_signature=(
+            tf.TensorSpec([None, 1], dtype=tf.float32),
+            tf.TensorSpec([], dtype=tf.bool),
+        )
+    )
     def get_action(self, s, return_all=False):
         """
         Return action list or singular action given state s
         """
-        s = tf.reshape(s, [self.n_states, 1])
         a = self._get_action_static(s)
 
         if not return_all:
-            a = tf.random.categorical(tf.expand_dims(a, 0), 1, dtype=tf.int64)
+            try:
+                a = tf.random.categorical(tf.expand_dims(a, 0), 1, dtype=tf.int64)
+            except:
+                print(f"Action: {a}")
+                raise
             a = tf.squeeze(a)
         else:
-            a = tf.reshape(a, [a.shape[0],])
+            a = tf.reshape(
+                a,
+                [
+                    self.n_actions,
+                ],
+            )
             a = tf.cast(a, tf.int64)
 
-        return a.numpy()
+        return a
 
     @tf.function
     def _apply_mask(self, mask, indices, updates):
@@ -284,7 +303,7 @@ class TransitionModelNN(BaseModel):
             mask = self._apply_mask(mask, indices, updates)
 
         # apply mask to remove clipped values
-        a = tf.boolean_mask(tf.reshape(self.a, [self.a.shape[0], 1]), mask)
+        a = tf.boolean_mask(tf.reshape(tf.identity(self.a), [self.n_actions, 1]), mask)
         a = tf.cast(a, tf.double)
         return a
 
@@ -294,7 +313,7 @@ class TransitionModelNN(BaseModel):
         Retrieve sars' batches from QNet replay buffer (reuse) and train model
         based on transition history
         """
-        sample = self.buffer.get_random_samples()
+        sample = self.replay_buffer.get_random_samples()
         # compute Q-targets and current Q values, get loss from TD error
         # take gradient over batch
         sample = tf.squeeze(tf.stop_gradient(sample))

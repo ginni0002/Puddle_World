@@ -8,6 +8,7 @@ import tensorflow as tf
 import seaborn as sns
 import matplotlib.pyplot as plt
 
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
 
 class PQueue:
 
@@ -20,6 +21,7 @@ class PQueue:
 
     def __len__(self):
         return len(self._queue)
+      
 
     def add(self, item):
         """
@@ -50,7 +52,7 @@ class PQueue:
             # compare last element of heap if full and replace/keep last element.
             if len(self._queue) == self.maxlen:
                 p_last, c_last = self._queue[-1]
-                if priority < p_last: 
+                if priority < p_last:
                     self._queue[-1] = tuple([priority, content])
                     self._entries[content] = priority
 
@@ -60,7 +62,6 @@ class PQueue:
             else:
                 heapq.heappush(self._queue, tuple([priority, content]))
                 self._entries[content] = priority
-
 
     def pop(self):
         """
@@ -77,65 +78,49 @@ class PQueue:
 
 
 class ReplayBuffer:
-    def __init__(self, maxlen=10000, sample_spec=None):
+    """
+    Tensorflow compatible custom replay buffer
+
+    """
+    def __init__(self, sample_spec, maxlen=10000, batch_size=32):
 
         self.maxlen = maxlen
-        self.replay_buffer = deque([], maxlen)
 
         # both model and dqn use same input spec
-        # TODO: replace hardcoded input spec
-        input_dims = 2
-
-        if not sample_spec:
-            self.sample_spec = (
-                tf.TensorSpec(
-                    [input_dims, 1],
-                    tf.float32,
-                    "state",
-                ),
-                tf.TensorSpec([], tf.int64, "action"),
-                tf.TensorSpec([], tf.float32, "reward"),
-                tf.TensorSpec(
-                    [input_dims, 1],
-                    tf.float32,
-                    "next_state",
-                ),
-            )
-        else:
-            self.sample_spec = sample_spec
+        self.sample_spec = [tf.TensorSpec([len(sample_spec), *sample_spec[0].shape.as_list()])]
+        self.batch_size = batch_size
 
         self.spec_shapes = [i.shape.as_list() for i in self.sample_spec]
+        self.replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+            data_spec=self.sample_spec[0],
+            batch_size=1,
+            max_length=maxlen
+        )
 
     def __len__(self):
         return len(self.replay_buffer)
 
-    def as_list(self):
-        return list(self.replay_buffer)
-
+    @tf.function
     def collect_rollout(self, sample):
         """
         Collect samples for the replay buffer for batch updates
         """
         try:
-            sample = [tf.broadcast_to(i, max(self.spec_shapes)) for i in sample]
-            sample = tf.expand_dims(sample, -1)
+            # add batch dim to items and append to replay buffer
+            self.replay_buffer.add_batch(tf.expand_dims(sample, 0))
         except ValueError:
             print(f"Invalid (s, a, r, s') tuple: {sample}")
             print(f"Valid shapes: {self.spec_shapes}")
             raise
 
-        self.replay_buffer.append(sample)
-
     @tf.function
-    def get_random_samples(self, batch_size=32):
+    def get_random_samples(self):
         """
         Generates a batch of indices from a uniform distribution
         """
-
-        indices = tf.random.uniform(
-            (batch_size,), 0, len(self.replay_buffer), dtype=tf.int32
-        )
-        return tf.gather(tf.identity(list(self.replay_buffer)), indices)
+        
+        sample_batch, _ = self.replay_buffer.get_next(self.batch_size)
+        return sample_batch
 
 
 def get_heatmap(matrix):
@@ -179,7 +164,7 @@ if __name__ == "__main__":
             gpus[0], [tf.config.LogicalDeviceConfiguration(memory_limit=512)]
         )
 
-    from model import Model, make_env
+    from model import TransitionModelNN, make_env
 
     env, env_params = make_env()
     grid_size = 40
@@ -187,8 +172,8 @@ if __name__ == "__main__":
         int(i)
         for i in (env.observation_space.high - env.observation_space.low) * grid_size
     ]
-    q_net = QNetwork(2, 4)
-    model = Model(grid_size, state_size, 4, env_params, 0.5)
+    q_net = (2, 4)
+    model = TransitionModelNN(grid_size, state_size, 4, env_params, 0.5)
     env.reset()
     try:
         for i in range(num_ep):

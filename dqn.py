@@ -1,12 +1,14 @@
 import tensorflow as tf
 from utils import ReplayBuffer
 
+
 class QNetwork:
 
     def __init__(
         self,
         input_dims: int,
         output_dims: int,
+        input_spec: tuple,
         lr: float = 0.001,
         gamma: float = 0.99,
         lambd: float = 0.5,
@@ -27,26 +29,13 @@ class QNetwork:
         self.loss = tf.keras.losses.Huber()
         self.model = self._build_model()
 
-        self.data_spec = (
-            tf.TensorSpec(
-                [input_dims, 1],
-                tf.float32,
-                "state",
-            ),
-            tf.TensorSpec([], tf.float32, "action"),
-            tf.TensorSpec([], tf.float32, "reward"),
-            tf.TensorSpec(
-                [input_dims, 1],
-                tf.float32,
-                "next_state",
-            ),
-        )
-        self.replay_buffer = ReplayBuffer(buffer_length, self.data_spec)
+        self.data_spec = input_spec
+        self.replay_buffer = ReplayBuffer(self.data_spec, buffer_length)
 
     def _build_model(self):
 
         inp = tf.keras.layers.Input(
-            shape=(self.input_dims,1),
+            shape=(self.input_dims, 1),
             # batch_size=self.batch_size,
         )
         x = inp
@@ -56,13 +45,6 @@ class QNetwork:
         x = tf.keras.layers.Flatten(name="flatten")(x)
         out = tf.keras.layers.Dense(self.n_output)(x)
         return tf.keras.Model(inputs=inp, outputs=out)
-
-    def collect_rollout(self, sars: tuple):
-        """
-        Collect samples for the replay buffer for batch updates
-        """
-        sars = [tf.cast(i, tf.float32) for i in sars]
-        self.replay_buffer.collect_rollout(sars)
 
     @tf.function(input_signature=(tf.TensorSpec([None, 1], dtype=tf.float32),))
     def predict(self, state):
@@ -92,9 +74,10 @@ class QNetwork:
 
             action_values = self.model(s)
             q_current = tf.gather(action_values, a, axis=1, batch_dims=1)
+            q_current = tf.reshape(q_current, q_target.shape)
             loss = self.loss(q_target, q_current)
             td_error = q_target - q_current
-        
+
         grads = tape.gradient(loss, self.model.trainable_weights)
-        grads = self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
+        self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
         return grads, td_error

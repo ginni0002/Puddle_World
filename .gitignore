@@ -1,4 +1,4 @@
 content/*
 samples/*
-optuna_study*
+optuna_study.pkl
 __pycache__

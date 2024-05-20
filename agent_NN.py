@@ -34,9 +34,30 @@ class DynaQ:
 
         self.action_size = self.env.action_space.n
         self.n_states = self.env.observation_space.shape[0]
-        self.q = QNetwork(self.n_states, self.action_size)
+        self.input_spec = (
+            tf.TensorSpec(
+                [self.n_states, 1],
+                tf.float32,
+                "state",
+            ),
+            tf.TensorSpec([], tf.int64, "action"),
+            tf.TensorSpec([], tf.float32, "reward"),
+            tf.TensorSpec(
+                [self.n_states, 1],
+                tf.float32,
+                "next_state",
+            ),
+        )
+        self.input_spec_shapes = [i.shape.as_list() for i in self.input_spec]
+
+        self.q = QNetwork(self.n_states, self.action_size, self.input_spec)
         self.model = TransitionModelNN(
-            self.n_states, self.state_size, self.action_size, env_params, h_weight
+            self.n_states,
+            self.state_size,
+            self.action_size,
+            env_params,
+            h_weight,
+            self.input_spec,
         )
 
         self.lambd = lambd
@@ -69,37 +90,41 @@ class DynaQ:
 
     @tf.function(
         input_signature=(
-            tf.TensorSpec([None, 1], tf.float32),
+            tf.TensorSpec(
+                [None, 1],
+            ),
             tf.TensorSpec([], tf.int64),
             tf.TensorSpec([], tf.float32),
-            tf.TensorSpec([None, 1], tf.float32),
+            tf.TensorSpec(
+                [None, 1],
+            ),
         )
     )
-    def _update_q_static(self, s, a, r, s_prime):
+    def update_q(self, s, a, r, s_prime):
+
+        s_prime = tf.cast(s_prime, tf.float32)
+        s = tf.cast(s, tf.float32)
+
+        s = tf.reshape(s, [self.n_states, 1])
+        s_prime = tf.reshape(s_prime, [self.n_states, 1])
 
         q_max = tf.reduce_max(self.q.predict(s_prime))
         q_vals = self.q.predict(s)
         q = tf.gather(q_vals, a)
         update = r + self.gamma * q_max - q
         self.avg_update.assign(0.05 * update + 0.95 * self.avg_update)
-
-        return update
-
-    def update_q(self, s, a, r, s_prime):
-
-        s_prime = tf.reshape(s_prime, [self.n_states, 1])
-        s_prime = tf.cast(s_prime, tf.float32)
-        s = tf.reshape(s, [self.n_states, 1])
-        s = tf.cast(s, tf.float32)
-
-        update = self._update_q_static(s, a, r, s_prime)
-
         r = tf.reshape(r, [1, 1])
         a = tf.reshape(a, [1, 1])
+        a = tf.cast(a, tf.float32)
 
+        a = tf.broadcast_to(a, self.input_spec_shapes[0])
+        r = tf.broadcast_to(r, self.input_spec_shapes[0])
+
+        sample = tf.stack([s, a, r, s_prime])
         # add transition to buffers
-        self.q.collect_rollout((s, a, r, s_prime))
-        self.model.add(s, a, r, s_prime)
+        self.q.replay_buffer.collect_rollout(sample)
+        self.model.replay_buffer.collect_rollout(sample)
+
         return update
 
     @tf.function(
@@ -110,7 +135,7 @@ class DynaQ:
             tf.TensorSpec([], tf.int64),
         )
     )
-    def _state_prop(self, s, a, s_bar, a_bar):
+    def _get_update_static(self, s, a, s_bar, a_bar):
         _, r_bar = self.model.step(s_bar, a_bar)
         update = self.update_q(s_bar, a, r_bar, s)
         is_update = self.p_thresh_upper > abs(update) > self.p_thresh_lower
@@ -119,7 +144,8 @@ class DynaQ:
     def choose_action(self, state, return_all=False):
 
         state = tf.cast(state, tf.float32)
-        if tf.random.uniform([]) < self.epsilon:
+        state = tf.reshape(state, [self.n_states, 1])
+        if tf.random.uniform([], 0.0, 1.0) < self.epsilon:
             a = self.model.get_action(state, return_all)
         else:
             # combine action scores and q values
@@ -128,8 +154,34 @@ class DynaQ:
             q_values = self.q.predict(state)
             action_scores = self.model.get_action_scores(state)
             p_scores = q_values + action_scores
-            a = np.argmax(p_scores)
+            a = tf.argmax(p_scores)
         return a
+
+    @tf.function(input_signature=(tf.TensorSpec([None, 1], tf.float32),))
+    def propogate_state(self, s):
+        # train step
+        self.q.learn()
+
+        # pick all neighbors of s, check their update value and add to PQueue if > threshold
+
+        # get random action for state s, use action on s to get to a neighbouring state s_bar
+        # get all available actions of s_bar except previously taken action and update
+        action = self.model.get_action(s)
+        s_bar, _ = self.model.step(s, action)
+        actions = self.model.get_action(s_bar, return_all=True)
+        # remove action taken in state s to get to s_bar to prevent infinite recursion
+        inv_action = tf.where(tf.math.equal(self.model.inv_action_keys, action))
+        inv_action = tf.squeeze(tf.gather(self.model.inv_action_values, inv_action))
+
+        ne_actions = tf.math.not_equal(actions, inv_action)
+        ne_actions.set_shape(
+            [
+                None,
+            ]
+        )
+        actions = tf.boolean_mask(actions, ne_actions)
+
+        return actions, s_bar
 
     def learn(self):
         """Perform DynaQ learning, return cumulative return"""
@@ -144,19 +196,26 @@ class DynaQ:
             # Epsilon greedy action
             a = self.choose_action(s)
             # Take action
-            s_prime, r, done, _, _ = self.env.step(a)
+            s_prime, r, done, _, _ = self.env.step(a.numpy())
             if self.render:
                 self.env.render()
             s_prime = self.model.featurize(s_prime)
 
             # Q-value update
+            s = tf.reshape(s, (self.n_states, 1))
+            s = tf.cast(s, tf.float32)
+
+            s_prime = tf.reshape(s_prime, (self.n_states, 1))
+            s_prime = tf.cast(s_prime, tf.float32)
             update = self.update_q(s, a, r, s_prime).numpy()
             self.q.learn()
             self.model.learn()
 
             # Check if update > theta, if yes: push to PQueue
             if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                self.p_queue.add((abs(update), (tuple(s), a)))
+                self.p_queue.add(
+                    (abs(update), (tuple(tf.squeeze(s).numpy()), a.numpy()))
+                )
 
             # Planning for n steps
             self.planning()
@@ -168,8 +227,6 @@ class DynaQ:
             # Add reward to count
             cum_reward += r
             step += 1
-
-            # print(time.time() - t1)
 
         # update epsilon
         self.epsilon = max(self.epsilon * self.epsilon_decay_rate, self.min_epsilon)
@@ -183,7 +240,6 @@ class DynaQ:
     def planning(self):
 
         for _ in range(self.n):
-
             if not len(self.p_queue):
                 break
             # get random state and action in that state
@@ -193,32 +249,17 @@ class DynaQ:
             s_prime, r = self.model.step(s, a)
             self.update_q(s, a, r, s_prime)
 
-            # train step
-            self.q.learn()
-
-            # pick all neighbors of s, check their update value and add to PQueue if > threshold
-
-            # get random action for state s, use action on s to get to a neighbouring state s_bar
-            # get all available actions of s_bar except previously taken action and update
-            action = self.model.get_action(s)
-            s_bar, _ = self.model.step(s, action)
-            actions = self.model.get_action(s_bar, return_all=True)
-            # remove action taken in state s to get to s_bar to prevent infinite recursion
-            inv_action = self.model.inverse_action[action]
-            actions = tf.boolean_mask(actions, tf.math.not_equal(actions, inv_action))
-
+            actions, s_bar = self.propogate_state(s)
             for a_bar in actions:
-                update, is_update = self._state_prop(s, a, s_bar, a_bar)
-                update = update.numpy()
+                update, is_update = self._get_update_static(s, a, s_bar, a_bar)
                 if is_update:
                     # only tuple is hashable
-                    s_ = tuple(tf.squeeze(s_bar).numpy())
+                    s_ = tuple(tf.squeeze(s_bar))
                     a_ = np.int64(a_bar)
                     self.p_queue.add((abs(update), (s_, a_)))
 
 
 def objective(trial: optuna.Trial):
-# def objective():
     try:
         alpha = 0.09  # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
         gamma = 0.7  # trial.suggest_float("gamma", 0.5, 0.99)
@@ -262,8 +303,6 @@ def objective(trial: optuna.Trial):
             for i in range(1, max_episodes):
                 t1 = time.time()
                 total_reward, num_steps, update_thresholds, queue_length = dyna.learn()
-                # q_table = get_heatmap(dyna.q)
-                # visits = get_heatmap(visits)
                 if i % 10 == 0:
                     dyna.render = True
                 else:
@@ -271,10 +310,7 @@ def objective(trial: optuna.Trial):
 
                 with summary_writer.as_default(step=i):
                     tf.summary.scalar("Episodic Reward", total_reward)
-                    # tf.summary.image("Q_table", q_table)
-                    # tf.summary.image("Visits", visits)
                     tf.summary.scalar("Total Steps", num_steps)
-                    # tf.summary.scalar("Average Q", np.average(dyna.q))
                     tf.summary.scalar(
                         "Update_threshold/lower", np.average(update_thresholds[0])
                     )
@@ -306,7 +342,7 @@ def objective(trial: optuna.Trial):
         env.close()
         return cumulative_reward
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
         trial.study.stop()
 
 
@@ -331,6 +367,6 @@ if __name__ == "__main__":
 
     try:
         study.optimize(objective, n_trials=100, show_progress_bar=True, n_jobs=1)
-    # objective()
+
     finally:
         joblib.dump(study, "optuna_study.pkl")
