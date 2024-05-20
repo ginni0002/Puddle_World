@@ -1,7 +1,7 @@
 import heapq
 import time
 import io
-from collections import deque
+from collections import defaultdict
 
 import numpy as np
 import tensorflow as tf
@@ -10,41 +10,67 @@ import matplotlib.pyplot as plt
 
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 
+
 class PQueue:
 
     def __init__(self, maxlen=100):
         self._queue = []
 
+        # Note that entries should be lists as the priority needs to be mutable
         # {content: priority}
-        self._entries = {}
+        self._entries = defaultdict(int)
         self.maxlen = maxlen
+        self.sample_value = [
+            tf.constant([0.1, 0.1]),
+            1.0
+        ]
 
     def __len__(self):
         return len(self._queue)
-      
 
-    def add(self, item):
+    def _get_hashed(self, content):
+        content = list(
+            map(
+                lambda x: (
+                    tf.cast(tf.expand_dims(x, -1), tf.float32)
+                    if len(tf.shape(x)) == 0
+                    else tf.cast(x, tf.float32)
+                ),
+                content,
+            )
+        )
+        c_hashed = tf.concat(content, 0)
+        c = hash(str(c_hashed).encode())
+        return c, content
+
+    def add(self, *item):
         """
         Inserts item into heap
-        item should be a tuple: (priority, content)
+        item should be a list: [priority, contents (spread out instead of a list)]
         """
+        while len(item) == 1:
+            item = item[0]
         assert (
-            isinstance(item, tuple)
-            and len(item) == 2
-            and isinstance(item[0], float | np.float32 | int)
-        ), "Item should be a tuple of length 2, (priority: float | int, content: any)"
+            isinstance(item, list | tuple)
+            # and isinstance(item[0], tf.Tensor)
+        ), f"Item should be a tuple or list, (priority: float | int, content: any), item: {item}"
 
         # since heapq implements min-heap, invert priority value
-        priority, content = item
+        priority, *content = item
         priority = -abs(priority)
-        if content in self._entries:
-            if priority < self._entries[content]:
-                item = tuple([priority, content])
-                arr = np.array(self._queue, dtype=object)[:, 1]
-                idx = np.array(list(map(lambda elem: elem == content, arr)))
-                idx = np.squeeze(np.where(np.squeeze(idx)))[()]
-                self._queue[idx] = item
-                self._entries[content] = priority
+        content_ref, content = self._get_hashed(content)
+
+        if content_ref in self._entries:
+            prev_priority = self._entries[content_ref]
+            if priority < prev_priority:
+                # if item in PQueue and higher priority, replace previous priority in heap and hashmap
+                self._entries[content_ref] = priority
+
+                heapq.heapify(self._queue)
+
+            # to maintain tf execution
+            else:
+                self._entries[content_ref] = prev_priority
         else:
             # insert item in heap and hashmap
 
@@ -53,28 +79,50 @@ class PQueue:
             if len(self._queue) == self.maxlen:
                 p_last, c_last = self._queue[-1]
                 if priority < p_last:
-                    self._queue[-1] = tuple([priority, content])
-                    self._entries[content] = priority
+                    self._queue[-1] = list([priority, content])
+                    self._entries[content_ref] = priority
+
+                    heapq.heapify(self._queue)
 
                     # remove previous entry
-                    self._entries.pop(c_last)
+                    c_last_ref, _ = self._get_hashed(c_last)
+                    self._entries.pop(c_last_ref)
+
+                # to maintain tf execution
+                else:
+                    self._entries[content_ref] = p_last
 
             else:
-                heapq.heappush(self._queue, tuple([priority, content]))
-                self._entries[content] = priority
+                heapq.heappush(self._queue, list([priority, content]))
+                self._entries[content_ref] = priority
+
+        return priority
 
     def pop(self):
         """
         Pops item with highest priority
         """
         if len(self._queue):
-            _, item = heapq.heappop(self._queue)
-            self._entries.pop(item)
-            item = list(item)
-            for idx, i in enumerate(item):
+            _, content = heapq.heappop(self._queue)
+            content_ref, _ = self._get_hashed(content)
+            del self._entries[content_ref]
+            item = list(
+                map(
+                    lambda x: (
+                        tf.squeeze(x)
+                        if len(tf.shape(x)) == 1
+                        else tf.cast(x, tf.float32)
+                    ),
+                    content,
+                )
+            )
+            for idx, i in enumerate(content):
                 if isinstance(i, tuple):
                     item[idx] = list(i)
             return item
+
+        else:
+            return self.sample_value
 
 
 class ReplayBuffer:
@@ -82,23 +130,21 @@ class ReplayBuffer:
     Tensorflow compatible custom replay buffer
 
     """
+
     def __init__(self, sample_spec, maxlen=10000, batch_size=32):
 
         self.maxlen = maxlen
 
         # both model and dqn use same input spec
-        self.sample_spec = [tf.TensorSpec([len(sample_spec), *sample_spec[0].shape.as_list()])]
+        self.sample_spec = [
+            tf.TensorSpec([len(sample_spec), *sample_spec[0].shape.as_list()])
+        ]
         self.batch_size = batch_size
 
         self.spec_shapes = [i.shape.as_list() for i in self.sample_spec]
         self.replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-            data_spec=self.sample_spec[0],
-            batch_size=1,
-            max_length=maxlen
+            data_spec=self.sample_spec[0], batch_size=1, max_length=maxlen
         )
-
-    def __len__(self):
-        return len(self.replay_buffer)
 
     @tf.function
     def collect_rollout(self, sample):
@@ -118,7 +164,7 @@ class ReplayBuffer:
         """
         Generates a batch of indices from a uniform distribution
         """
-        
+
         sample_batch, _ = self.replay_buffer.get_next(self.batch_size)
         return sample_batch
 
@@ -152,42 +198,19 @@ def get_heatmap(matrix):
     image = tf.expand_dims(image, 0)
     return image
 
+# https://github.com/tensorflow/tensorflow/issues/8496
+@tf.function
+def random_choice(x, size, axis=0, unique=True):
+    dim_x = tf.cast(tf.shape(x)[axis], tf.int64)
+    indices = tf.range(0, dim_x, dtype=tf.int64)
+    sample_index = tf.random.shuffle(indices)[:size]
+    sample = tf.gather(x, sample_index, axis=axis)
+
+    return sample, sample_index
+
 
 if __name__ == "__main__":
 
-    num_ep = 1000
-    s = (0.0, 1.0)
-
-    gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        tf.config.set_logical_device_configuration(
-            gpus[0], [tf.config.LogicalDeviceConfiguration(memory_limit=512)]
-        )
-
-    from model import TransitionModelNN, make_env
-
-    env, env_params = make_env()
-    grid_size = 40
-    state_size = [
-        int(i)
-        for i in (env.observation_space.high - env.observation_space.low) * grid_size
-    ]
-    q_net = (2, 4)
-    model = TransitionModelNN(grid_size, state_size, 4, env_params, 0.5)
-    env.reset()
-    try:
-        for i in range(num_ep):
-
-            a = q_net.predict(tf.reshape(s, q_net.spec_shapes[0]))
-            a = np.argmax(a)
-            s_, r, _, _, _ = env.step(a)
-            a = tf.reshape(a, (1,))
-            r = tf.reshape(r, (1,))
-            q_net.collect_rollout((s, a, r, s_))
-            if i == 0:
-                t1 = time.time()
-            if i == q_net.batch_size:
-                q_net.learn()
-        print(time.time() - t1)
-    except Exception as e:
-        raise e
+    a = tf.constant([1, 2])
+    for _ in range(10):
+        print(random_choice(a, 1)[0])

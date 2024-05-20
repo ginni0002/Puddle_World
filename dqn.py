@@ -28,10 +28,12 @@ class QNetwork:
         self.opt = tf.keras.optimizers.Adam(lr)
         self.loss = tf.keras.losses.Huber()
         self.model = self._build_model()
+        self.model.compile(self.opt, self.loss, metrics=["accuracy"])
 
         self.data_spec = input_spec
         self.replay_buffer = ReplayBuffer(self.data_spec, buffer_length)
 
+    
     def _build_model(self):
 
         inp = tf.keras.layers.Input(
@@ -76,8 +78,7 @@ class QNetwork:
             q_current = tf.gather(action_values, a, axis=1, batch_dims=1)
             q_current = tf.reshape(q_current, q_target.shape)
             loss = self.loss(q_target, q_current)
-            td_error = q_target - q_current
 
         grads = tape.gradient(loss, self.model.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
-        return grads, td_error
+        return loss

@@ -208,18 +208,19 @@ class DynaQ:
             s_prime = tf.reshape(s_prime, (self.n_states, 1))
             s_prime = tf.cast(s_prime, tf.float32)
             update = self.update_q(s, a, r, s_prime).numpy()
-            self.q.learn()
-            self.model.learn()
+            loss_q = self.q.learn()
+            loss_model = self.model.learn()
 
             # Check if update > theta, if yes: push to PQueue
             if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                self.p_queue.add(
-                    (abs(update), (tuple(tf.squeeze(s).numpy()), a.numpy()))
-                )
+                self.p_queue.add([abs(update), tf.squeeze(s), a])
 
             # Planning for n steps
-            self.planning()
-
+            tf.map_fn(
+                self.planning,
+                tf.range(0, self.n, dtype=tf.int32),
+                tf.TensorSpec([], tf.int32),
+            )
             s = s_prime
             if done:
                 s, _ = self.env.reset()
@@ -234,29 +235,44 @@ class DynaQ:
             cum_reward,
             step,
             (self.p_thresh_lower, abs(self.avg_update), self.p_thresh_upper),
-            len(self.p_queue),
+            loss_q,
+            loss_model,
         )
 
-    def planning(self):
+    @tf.function
+    def _update_pqueue(self, s, a, s_bar, a_bar):
+        update, is_update = self._get_update_static(s, a, s_bar, a_bar)
+        if is_update:
+            # only tuple is hashable
+            s_ = tf.squeeze(s_bar)
+            a_ = tf.cast(a_bar, tf.int64)
+            tf.py_function(
+                func=self.p_queue.add,
+                inp=[tf.math.abs(update), s_, a_],
+                Tout=tf.float32,
+            )
+        return is_update
 
-        for _ in range(self.n):
-            if not len(self.p_queue):
-                break
+    @tf.function
+    def planning(self, i):
+
+        if len(self.p_queue):
             # get random state and action in that state
-            s, a = self.p_queue.pop()
+            s, a = tf.py_function(self.p_queue.pop())
+            a = tf.cast(a, tf.int64)
             s = tf.reshape(s, (self.n_states, 1))
             s = tf.cast(s, tf.float32)
             s_prime, r = self.model.step(s, a)
             self.update_q(s, a, r, s_prime)
 
             actions, s_bar = self.propogate_state(s)
-            for a_bar in actions:
-                update, is_update = self._get_update_static(s, a, s_bar, a_bar)
-                if is_update:
-                    # only tuple is hashable
-                    s_ = tuple(tf.squeeze(s_bar))
-                    a_ = np.int64(a_bar)
-                    self.p_queue.add((abs(update), (s_, a_)))
+
+            tf.map_fn(
+                lambda x: self._update_pqueue(s, a, s_bar, x),
+                actions,
+                fn_output_signature=tf.TensorSpec([], tf.bool),
+            )
+        return i
 
 
 def objective(trial: optuna.Trial):
@@ -264,10 +280,10 @@ def objective(trial: optuna.Trial):
         alpha = 0.09  # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
         gamma = 0.7  # trial.suggest_float("gamma", 0.5, 0.99)
         # epsilon = trial.suggest_float("epsilon", 0.5, 1.0, step=0.1)
-        lambd = 0.7  # trial.suggest_float("lambd", 0.1, 0.9, step=0.1)
+        lambd = trial.suggest_float("lambd", 0.1, 0.9, step=0.1)
         epsilon = 1.0
         planning_steps = 10  # planning loop terminates if priority queue is empty
-        h_weight = 0.5  # trial.suggest_float("h_weight", 0.1, 1.0, step=0.1)
+        h_weight = trial.suggest_float("h_weight", 0.1, 1.0, step=0.1)
         env, env_params = make_env()
 
         max_steps = 1000
@@ -302,11 +318,13 @@ def objective(trial: optuna.Trial):
         with tf.device("/GPU:0"):
             for i in range(1, max_episodes):
                 t1 = time.time()
-                total_reward, num_steps, update_thresholds, queue_length = dyna.learn()
-                if i % 10 == 0:
-                    dyna.render = True
-                else:
-                    dyna.render = False
+                total_reward, num_steps, update_thresholds, loss_q, loss_model = (
+                    dyna.learn()
+                )
+                # if i % 10 == 0:
+                #     dyna.render = True
+                # else:
+                #     dyna.render = False
 
                 with summary_writer.as_default(step=i):
                     tf.summary.scalar("Episodic Reward", total_reward)
@@ -321,17 +339,17 @@ def objective(trial: optuna.Trial):
                     tf.summary.scalar(
                         "Update_threshold/upper", np.average(update_thresholds[2])
                     )
-                    tf.summary.scalar(
-                        "PQueue_length",
-                        queue_length,
-                    )
+
+                    tf.summary.scalar("Losses/QNet", loss_q)
+
+                    tf.summary.scalar("Losses/Model", loss_model)
 
                 print(
                     f"Episode: {i:4d} |",
                     f" Reward: {total_reward:6.2f} |",
                     f"Epsilon: {dyna.epsilon:4.2f} |",
                     f"Num-Steps: {num_steps:4d} |",
-                    f"Time: {time.time() - t1:4.2f}",
+                    f"Time/Episode: {time.time() - t1:4.2f}",
                 )
                 cumulative_reward += total_reward
 
@@ -370,3 +388,4 @@ if __name__ == "__main__":
 
     finally:
         joblib.dump(study, "optuna_study.pkl")
+    # objective()

@@ -36,7 +36,6 @@ class BaseModel:
 
         # TODO: Use state abstraction to get scores
         # normalize s to range [0., 1.]
-        s = (s - np.min(s)) / (np.max(s) - np.min(s))
 
         if ref == "goal":
             pos = self.goal_pos
@@ -169,11 +168,13 @@ class TransitionModelNN(BaseModel):
         self.model = self._build_model()
         self.opt = tf.keras.optimizers.Adam(self.lr)
         self.loss = tf.keras.losses.MeanSquaredError()
+        self.model.compile(self.opt, self.loss, metrics=["accuracy"])
 
         self.spec_shapes = input_spec
         self.replay_buffer = ReplayBuffer(input_spec)
         self.a = tf.range(0, self.n_actions, dtype=tf.int32)
-
+        self.action_mask = tf.ones([self.a.shape[0], 1], tf.int32)
+    
     def _build_model(self):
 
         state = tf.keras.layers.Input(shape=[self.n_states, 1], name="state_inp")
@@ -243,7 +244,7 @@ class TransitionModelNN(BaseModel):
         s_prime = tf.vectorized_map(
             lambda x: self._get_bounded_state(x[0], x[1]), (state_dims, s_prime)
         )
-
+        tf.print(s_prime)
         s_prime = tf.reshape(s_prime, tf.shape(s))
         return s_prime, r
 
@@ -293,7 +294,7 @@ class TransitionModelNN(BaseModel):
         x_clip = tf.clip_by_value(x, *self.state_size[0])
         y_clip = tf.clip_by_value(y, *self.state_size[1])
 
-        mask = tf.ones([self.a.shape[0], 1], tf.int32)
+        mask = tf.identity(self.action_mask)
         for idx, (pos, bound) in enumerate(zip([x_clip, y_clip], self.state_size)):
             low = tf.math.not_equal(pos, bound[0])
             high = tf.math.equal(pos, bound[1])
@@ -305,6 +306,8 @@ class TransitionModelNN(BaseModel):
         # apply mask to remove clipped values
         a = tf.boolean_mask(tf.reshape(tf.identity(self.a), [self.n_actions, 1]), mask)
         a = tf.cast(a, tf.double)
+        if len(a) == 0:
+            tf.print(s)
         return a
 
     @tf.function
@@ -332,7 +335,7 @@ class TransitionModelNN(BaseModel):
             loss = self.loss(s_prime, next_state_predict) + self.loss(r, reward_predict)
         grads = tape.gradient(loss, self.model.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
-
+        return loss
 
 def make_env(prev_env=None):
     """
