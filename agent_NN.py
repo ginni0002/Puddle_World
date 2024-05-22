@@ -7,7 +7,13 @@ import tensorflow as tf
 import numpy as np
 import optuna
 
-from utils import PQueue, get_heatmap
+gpus = tf.config.list_physical_devices("GPU")
+for gpu in gpus:
+    tf.config.set_logical_device_configuration(
+        gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=8192)]
+    )
+
+from utils import PQueue
 from model import TransitionModelNN, make_env
 from dqn import QNetwork
 
@@ -63,7 +69,10 @@ class DynaQ:
         self.lambd = lambd
 
         # Priority sampling
-        self.p_queue = PQueue()
+        self.p_queue = PQueue(
+            shapes=[self.input_spec_shapes[0], self.input_spec_shapes[1]],
+            types=[self.input_spec[0].dtype, self.input_spec[1].dtype],
+        )
         # initial thresholds, will change as q values grow/shrink
         # upper threshold is fixed to prevent agent from just updating puddle interactions
         self.p_thresh_lower = 0.01
@@ -72,9 +81,9 @@ class DynaQ:
         self.avg_update = tf.Variable(0.0)
 
         self.epsilon = epsilon
-        self.epsilon_decay_rate = 0.99
+        self.epsilon_decay_rate = 0.995
         self.min_epsilon = 0.01
-        self.n = n
+        self.n = tf.Variable(n)
         self.max_steps = max_steps
         self.alpha = tf.Variable(alpha)
         self.gamma = tf.Variable(gamma)
@@ -154,7 +163,7 @@ class DynaQ:
             q_values = self.q.predict(state)
             action_scores = self.model.get_action_scores(state)
             p_scores = q_values + action_scores
-            a = tf.argmax(p_scores)
+            a = tf.argmax(p_scores) if not return_all else p_scores
         return a
 
     @tf.function(input_signature=(tf.TensorSpec([None, 1], tf.float32),))
@@ -192,7 +201,6 @@ class DynaQ:
         done = False
 
         while not done and step != self.max_steps:
-            # t1 = time.time()
             # Epsilon greedy action
             a = self.choose_action(s)
             # Take action
@@ -213,14 +221,10 @@ class DynaQ:
 
             # Check if update > theta, if yes: push to PQueue
             if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                self.p_queue.add([abs(update), tf.squeeze(s), a])
+                self.p_queue.add(abs(update), [s, tf.cast(a, tf.int64)])
 
             # Planning for n steps
-            tf.map_fn(
-                self.planning,
-                tf.range(0, self.n, dtype=tf.int32),
-                tf.TensorSpec([], tf.int32),
-            )
+            self.__map_parallel_planning()
             s = s_prime
             if done:
                 s, _ = self.env.reset()
@@ -239,7 +243,14 @@ class DynaQ:
             loss_model,
         )
 
-    @tf.function
+    @tf.function(
+        input_signature=(
+            tf.TensorSpec([None, 1], tf.float32),
+            tf.TensorSpec([], tf.int64),
+            tf.TensorSpec([None, 1], tf.float32),
+            tf.TensorSpec([], tf.int64),
+        )
+    )
     def _update_pqueue(self, s, a, s_bar, a_bar):
         update, is_update = self._get_update_static(s, a, s_bar, a_bar)
         if is_update:
@@ -254,11 +265,19 @@ class DynaQ:
         return is_update
 
     @tf.function
+    def __map_parallel_planning(self):
+        tf.map_fn(self.planning, tf.range(self.n), parallel_iterations=2)
+
+    @tf.function
     def planning(self, i):
 
-        if len(self.p_queue):
+        if tf.math.not_equal(self.p_queue.size(), tf.constant(0, tf.int32)):
             # get random state and action in that state
-            s, a = tf.py_function(self.p_queue.pop())
+            s, a = tf.py_function(
+                self.p_queue.pop,
+                inp=[],
+                Tout=[self.input_spec[0].dtype, self.input_spec[1].dtype],
+            )
             a = tf.cast(a, tf.int64)
             s = tf.reshape(s, (self.n_states, 1))
             s = tf.cast(s, tf.float32)
@@ -271,17 +290,19 @@ class DynaQ:
                 lambda x: self._update_pqueue(s, a, s_bar, x),
                 actions,
                 fn_output_signature=tf.TensorSpec([], tf.bool),
+                parallel_iterations=2,
             )
         return i
 
 
+# def objective():
 def objective(trial: optuna.Trial):
     try:
-        alpha = 0.09  # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
-        gamma = 0.7  # trial.suggest_float("gamma", 0.5, 0.99)
+        alpha = trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
+        gamma = 0.99  # trial.suggest_float("gamma", 0.5, 0.99)
         # epsilon = trial.suggest_float("epsilon", 0.5, 1.0, step=0.1)
         lambd = trial.suggest_float("lambd", 0.1, 0.9, step=0.1)
-        epsilon = 1.0
+        epsilon = 0.4
         planning_steps = 10  # planning loop terminates if priority queue is empty
         h_weight = trial.suggest_float("h_weight", 0.1, 1.0, step=0.1)
         env, env_params = make_env()
@@ -301,6 +322,7 @@ def objective(trial: optuna.Trial):
                 + datetime.now().strftime("%Y%m%d-%H%M%S"),
             )
         )
+
         dyna = DynaQ(
             env,
             planning_steps,
@@ -314,17 +336,16 @@ def objective(trial: optuna.Trial):
             lambd,
         )
         cumulative_reward = 0.0
-
         with tf.device("/GPU:0"):
             for i in range(1, max_episodes):
                 t1 = time.time()
                 total_reward, num_steps, update_thresholds, loss_q, loss_model = (
                     dyna.learn()
                 )
-                # if i % 10 == 0:
-                #     dyna.render = True
-                # else:
-                #     dyna.render = False
+                if i % 10 == 0:
+                    dyna.render = True
+                else:
+                    dyna.render = False
 
                 with summary_writer.as_default(step=i):
                     tf.summary.scalar("Episodic Reward", total_reward)
@@ -362,12 +383,14 @@ def objective(trial: optuna.Trial):
 
     except KeyboardInterrupt as e:
         trial.study.stop()
+        # raise
 
 
 if __name__ == "__main__":
 
     log_folder = "samples"
     model_dir = "agents"
+
     if not os.path.exists(log_folder):
         os.mkdir(log_folder)
 
@@ -377,14 +400,8 @@ if __name__ == "__main__":
         sampler=optuna.samplers.TPESampler(),
     )
 
-    gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        tf.config.set_logical_device_configuration(
-            gpus[0], [tf.config.LogicalDeviceConfiguration(memory_limit=2048)]
-        )
-
     try:
-        study.optimize(objective, n_trials=100, show_progress_bar=True, n_jobs=1)
+        study.optimize(objective, n_trials=100, show_progress_bar=True)
 
     finally:
         joblib.dump(study, "optuna_study.pkl")

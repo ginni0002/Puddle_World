@@ -1,6 +1,6 @@
 import random
 import time
-from utils import ReplayBuffer
+from utils import ReplayBuffer, random_choice
 
 import gym_puddle
 import gymnasium as gym
@@ -159,7 +159,9 @@ class ModelTabular(BaseModel):
 
 class TransitionModelNN(BaseModel):
 
-    def __init__(self, n_states, state_size, n_actions, env_params, h_weight, input_spec):
+    def __init__(
+        self, n_states, state_size, n_actions, env_params, h_weight, input_spec
+    ):
         super().__init__(n_states, state_size, n_actions, env_params, h_weight)
 
         self.batch_size = 32
@@ -167,14 +169,14 @@ class TransitionModelNN(BaseModel):
         self.lr = 1e-3
         self.model = self._build_model()
         self.opt = tf.keras.optimizers.Adam(self.lr)
-        self.loss = tf.keras.losses.MeanSquaredError()
+        self.loss = tf.keras.losses.Huber()
         self.model.compile(self.opt, self.loss, metrics=["accuracy"])
 
         self.spec_shapes = input_spec
         self.replay_buffer = ReplayBuffer(input_spec)
         self.a = tf.range(0, self.n_actions, dtype=tf.int32)
         self.action_mask = tf.ones([self.a.shape[0], 1], tf.int32)
-    
+
     def _build_model(self):
 
         state = tf.keras.layers.Input(shape=[self.n_states, 1], name="state_inp")
@@ -244,7 +246,6 @@ class TransitionModelNN(BaseModel):
         s_prime = tf.vectorized_map(
             lambda x: self._get_bounded_state(x[0], x[1]), (state_dims, s_prime)
         )
-        tf.print(s_prime)
         s_prime = tf.reshape(s_prime, tf.shape(s))
         return s_prime, r
 
@@ -254,27 +255,25 @@ class TransitionModelNN(BaseModel):
             tf.TensorSpec([], dtype=tf.bool),
         )
     )
-    def get_action(self, s, return_all=False):
+    def get_action(self, s, return_all=tf.constant(False, tf.bool)):
         """
         Return action list or singular action given state s
         """
         a = self._get_action_static(s)
-
-        if not return_all:
-            try:
-                a = tf.random.categorical(tf.expand_dims(a, 0), 1, dtype=tf.int64)
-            except:
-                print(f"Action: {a}")
-                raise
-            a = tf.squeeze(a)
+        if tf.math.equal(len(a), 0):
+            a = tf.cast(0, tf.int64)
         else:
-            a = tf.reshape(
-                a,
-                [
-                    self.n_actions,
-                ],
-            )
-            a = tf.cast(a, tf.int64)
+
+            if return_all:
+                a = tf.reshape(
+                    a,
+                    [self.n_actions, ],
+                )
+                a = tf.cast(a, tf.int64)
+            else:
+                a, _ = random_choice(a, 1)
+                a = tf.squeeze(a)
+                a = tf.cast(a, tf.int64)
 
         return a
 
@@ -306,8 +305,6 @@ class TransitionModelNN(BaseModel):
         # apply mask to remove clipped values
         a = tf.boolean_mask(tf.reshape(tf.identity(self.a), [self.n_actions, 1]), mask)
         a = tf.cast(a, tf.double)
-        if len(a) == 0:
-            tf.print(s)
         return a
 
     @tf.function
@@ -336,6 +333,7 @@ class TransitionModelNN(BaseModel):
         grads = tape.gradient(loss, self.model.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.model.trainable_weights))
         return loss
+
 
 def make_env(prev_env=None):
     """
@@ -379,7 +377,6 @@ def make_env(prev_env=None):
 
     env = gym.make(
         "PuddleWorld-v0",
-        render_mode="human",
         start=env_params["start"],
         goal=env_params["goal"],
         noise=env_params["noise"],

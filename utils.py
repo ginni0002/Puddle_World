@@ -1,9 +1,7 @@
 import heapq
-import time
-import io
-from collections import defaultdict
-
 import numpy as np
+import io
+
 import tensorflow as tf
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -13,116 +11,140 @@ from tf_agents.replay_buffers import tf_uniform_replay_buffer
 
 class PQueue:
 
-    def __init__(self, maxlen=100):
+    def __init__(self, shapes, types, maxlen=10000):
         self._queue = []
+
+        self.shapes = shapes
+        self.types = types
 
         # Note that entries should be lists as the priority needs to be mutable
         # {content: priority}
-        self._entries = defaultdict(int)
-        self.maxlen = maxlen
-        self.sample_value = [
-            tf.constant([0.1, 0.1]),
-            1.0
-        ]
+        self.maxlen = tf.cast(maxlen, tf.int32)
 
-    def __len__(self):
-        return len(self._queue)
+        self._entries = tf.lookup.experimental.DenseHashTable(
+            key_dtype=tf.int64,
+            value_dtype=tf.float32,
+            default_value=tf.constant((0.), tf.float32),
+            empty_key=0,
+            deleted_key=-100,
+        )
 
+        self.default_value = []
+        for shape, type in zip(shapes, types):
+            self.default_value.append(tf.random.uniform(shape, maxval=1, dtype=type))
+
+    @tf.function(
+        input_signature=(
+            [tf.TensorSpec([None, 1], tf.float32), tf.TensorSpec([], tf.int64)],
+        )
+    )
     def _get_hashed(self, content):
-        content = list(
+
+        c_new = list(
             map(
                 lambda x: (
-                    tf.cast(tf.expand_dims(x, -1), tf.float32)
+                    tf.expand_dims(tf.cast(x, tf.float32), -1)
                     if len(tf.shape(x)) == 0
-                    else tf.cast(x, tf.float32)
+                    else tf.squeeze(tf.cast(x, tf.float32))
                 ),
                 content,
             )
         )
-        c_hashed = tf.concat(content, 0)
-        c = hash(str(c_hashed).encode())
-        return c, content
 
-    def add(self, *item):
+        tensor_to_string = tf.strings.as_string(tf.concat(c_new, 0))
+        hashed_values = tf.strings.to_hash_bucket_fast(tensor_to_string, 1 << 10)
+        return tf.reduce_sum(hashed_values)
+
+    @tf.function
+    def size(self):
+        return len(self._queue)
+
+    def add(self, priority, content):
         """
         Inserts item into heap
         item should be a list: [priority, contents (spread out instead of a list)]
         """
-        while len(item) == 1:
-            item = item[0]
-        assert (
-            isinstance(item, list | tuple)
-            # and isinstance(item[0], tf.Tensor)
-        ), f"Item should be a tuple or list, (priority: float | int, content: any), item: {item}"
 
-        # since heapq implements min-heap, invert priority value
-        priority, *content = item
-        priority = -abs(priority)
-        content_ref, content = self._get_hashed(content)
+        def update_item(c_ref, c):
+            # if item in PQueue and higher priority, replace previous priority in heap and hashmap
+            prev_priority = self._entries.lookup(c_ref)
+            tf.cond(
+                tf.cast(priority < prev_priority, tf.bool),
+                lambda: true_func2(c_ref, c),
+                lambda: False,
+            )
 
-        if content_ref in self._entries:
-            prev_priority = self._entries[content_ref]
-            if priority < prev_priority:
-                # if item in PQueue and higher priority, replace previous priority in heap and hashmap
-                self._entries[content_ref] = priority
+        def true_func2(c_ref, c):
+            heapq.heapify(self._queue)
+            self._entries.insert_or_assign(c_ref, priority)
+            return True
 
-                heapq.heapify(self._queue)
-
-            # to maintain tf execution
-            else:
-                self._entries[content_ref] = prev_priority
-        else:
+        def create_item(c_ref, c):
             # insert item in heap and hashmap
 
             # check if heap is filled
             # compare last element of heap if full and replace/keep last element.
-            if len(self._queue) == self.maxlen:
-                p_last, c_last = self._queue[-1]
+            if tf.equal(self.size(), self.maxlen):
+                p_last, *c_last = self._queue[-1]
                 if priority < p_last:
-                    self._queue[-1] = list([priority, content])
-                    self._entries[content_ref] = priority
-
-                    heapq.heapify(self._queue)
+                    self._queue[-1] = [priority, *c]
+                    self._entries.insert_or_assign(c_ref, priority)
 
                     # remove previous entry
-                    c_last_ref, _ = self._get_hashed(c_last)
-                    self._entries.pop(c_last_ref)
+                    c_ref_last = self._get_hashed(c_last)
+                    self._entries.erase(tf.expand_dims(c_ref_last, -1))
 
                 # to maintain tf execution
                 else:
-                    self._entries[content_ref] = p_last
+                    self._entries.insert_or_assign(c_last, p_last)
 
             else:
-                heapq.heappush(self._queue, list([priority, content]))
-                self._entries[content_ref] = priority
+                heapq.heappush(self._queue, [priority, *c])
+                self._entries.insert_or_assign(c_ref, priority)
 
-        return priority
+        # since heapq implements min-heap, invert priority value
+        priority = -abs(priority)
+
+        # tf priority queues take int priority only
+        priority = tf.cast(priority, tf.float32).numpy()
+        content_ref = self._get_hashed(content)
+
+        # reshape content to match Priority Queue shapes
+        content = list(map(lambda c: tf.squeeze(tf.cast(c, tf.float32)), content))
+
+        # if lookup returns non-default value -> item exists, check priority and update
+        tf.cond(
+            tf.cast(
+                tf.math.not_equal(
+                    self._entries.lookup(content_ref), self._entries._default_value
+                ),
+                tf.bool,
+            ),
+            lambda: update_item(content_ref, content),
+            lambda: create_item(content_ref, content),
+        )
+
+        return self.maxlen
 
     def pop(self):
         """
         Pops item with highest priority
         """
-        if len(self._queue):
+
+        if tf.math.not_equal(self.size(), tf.constant(0, tf.int32)):
             _, content = heapq.heappop(self._queue)
-            content_ref, _ = self._get_hashed(content)
-            del self._entries[content_ref]
-            item = list(
-                map(
-                    lambda x: (
-                        tf.squeeze(x)
-                        if len(tf.shape(x)) == 1
-                        else tf.cast(x, tf.float32)
-                    ),
-                    content,
-                )
-            )
+            content_ref = self._get_hashed(content)
+
+            self._entries.erase(tf.expand_dims(content_ref, -1))
+            item = content
             for idx, i in enumerate(content):
                 if isinstance(i, tuple):
                     item[idx] = list(i)
             return item
 
         else:
-            return self.sample_value
+
+            return self.default_value
 
 
 class ReplayBuffer:
@@ -197,6 +219,7 @@ def get_heatmap(matrix):
     # Add the batch dimension
     image = tf.expand_dims(image, 0)
     return image
+
 
 # https://github.com/tensorflow/tensorflow/issues/8496
 @tf.function
