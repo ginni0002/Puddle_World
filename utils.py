@@ -21,12 +21,21 @@ class PQueue:
         # {content: priority}
         self.maxlen = tf.cast(maxlen, tf.int32)
 
-        self._entries = tf.lookup.experimental.DenseHashTable(
-            key_dtype=tf.int64,
+        # store priority as key and (s, a) as tensor value concatenated
+        self._entries_content = tf.lookup.experimental.DenseHashTable(
+            key_dtype=tf.string,
             value_dtype=tf.float32,
-            default_value=tf.constant((0.), tf.float32),
-            empty_key=0,
-            deleted_key=-100,
+            default_value=tf.constant((0.0, 0.0, 0.0), tf.float32),
+            empty_key="-101",
+            deleted_key="-100",
+        )
+
+        self._entries_priority = tf.lookup.experimental.DenseHashTable(
+            key_dtype=tf.string,
+            value_dtype=tf.float32,
+            default_value=tf.constant(100.0, tf.float32),
+            empty_key="",
+            deleted_key="!",
         )
 
         self.default_value = []
@@ -38,8 +47,7 @@ class PQueue:
             [tf.TensorSpec([None, 1], tf.float32), tf.TensorSpec([], tf.int64)],
         )
     )
-    def _get_hashed(self, content):
-
+    def _concat_tensors(self, content):
         c_new = list(
             map(
                 lambda x: (
@@ -50,10 +58,41 @@ class PQueue:
                 content,
             )
         )
+        return tf.concat(c_new, 0)
 
-        tensor_to_string = tf.strings.as_string(tf.concat(c_new, 0))
-        hashed_values = tf.strings.to_hash_bucket_fast(tensor_to_string, 1 << 10)
-        return tf.reduce_sum(hashed_values)
+    # @tf.function(input_signature=(tf.TensorSpec([None, 1], tf.float32),))
+    def _get_unstacked_tensors(self, content_concat):
+        s, a = tf.split(content_concat, [self.shapes[0][0], self.shapes[1][0]])
+        return [s, a]
+
+    # @tf.function(
+    #     input_signature=(
+    #         [tf.TensorSpec([None, 1], tf.float32), tf.TensorSpec([], tf.int64)],
+    #     )
+    # )
+    # def _get_hashed(self, content):
+
+    #     c_new = self._concat_tensors(content)
+
+    #     tensor_to_string = tf.strings.as_string(c_new)
+    #     hashed_values = tf.strings.to_hash_bucket_fast(tensor_to_string, 1 << 10)
+    #     return tf.reduce_sum(hashed_values)
+
+    @tf.function
+    def _update_hashmap(self, priority, c_ref, prev_priority=None):
+        c_ref_val = tf.identity(c_ref)
+        priority_val = tf.identity(priority)
+
+        c_ref = str(c_ref)
+        priority = str(priority)
+        self._entries_content.insert_or_assign(priority, c_ref_val)
+        self._entries_priority.insert_or_assign(c_ref, priority_val)
+
+        if prev_priority:
+            prev_priority = str(prev_priority)
+            prev_c_ref = self._entries_content.lookup(prev_priority)
+            self._entries_priority.erase(tf.expand_dims(prev_c_ref, -1))
+            self._entries_content.erase(tf.expand_dims(prev_priority, -1))
 
     @tf.function
     def size(self):
@@ -65,64 +104,72 @@ class PQueue:
         item should be a list: [priority, contents (spread out instead of a list)]
         """
 
-        def update_item(c_ref, c):
+        def update_item(c_ref, priority):
             # if item in PQueue and higher priority, replace previous priority in heap and hashmap
-            prev_priority = self._entries.lookup(c_ref)
+            prev_priority = self._entries_priority.lookup(str(c_ref))
             tf.cond(
                 tf.cast(priority < prev_priority, tf.bool),
-                lambda: true_func2(c_ref, c),
+                lambda: true_func2(c_ref, priority, prev_priority),
                 lambda: False,
             )
 
-        def true_func2(c_ref, c):
+        def true_func2(c_ref, priority, prev_priority):
+            # get index of priority for prev content from PQueue and update PQueue priority -> content_new
+            idx = tf.squeeze(
+                tf.where(self._queue == tf.constant(prev_priority)), axis=0
+            )[0]
+            self._queue[idx] = priority
             heapq.heapify(self._queue)
-            self._entries.insert_or_assign(c_ref, priority)
-            return True
 
-        def create_item(c_ref, c):
+            # update references in hashmap
+            self._update_hashmap(priority, c_ref, prev_priority)
+
+        def create_item(c_ref, priority):
             # insert item in heap and hashmap
 
             # check if heap is filled
             # compare last element of heap if full and replace/keep last element.
             if tf.equal(self.size(), self.maxlen):
-                p_last, *c_last = self._queue[-1]
+                p_last = self._queue[-1]
                 if priority < p_last:
-                    self._queue[-1] = [priority, *c]
-                    self._entries.insert_or_assign(c_ref, priority)
-
-                    # remove previous entry
-                    c_ref_last = self._get_hashed(c_last)
-                    self._entries.erase(tf.expand_dims(c_ref_last, -1))
-
-                # to maintain tf execution
-                else:
-                    self._entries.insert_or_assign(c_last, p_last)
+                    heapq.heapreplace(self._queue, priority)
+                    self._update_hashmap(priority, c_ref, p_last)
 
             else:
-                heapq.heappush(self._queue, [priority, *c])
-                self._entries.insert_or_assign(c_ref, priority)
+                # not filled, just insert and update
+                heapq.heappush(self._queue, priority)
+                self._update_hashmap(priority, c_ref)
 
-        # since heapq implements min-heap, invert priority value
-        priority = -abs(priority)
+        # since heapq implements min-heap, negate priority value
+        priority = -priority
 
         # tf priority queues take int priority only
         priority = tf.cast(priority, tf.float32).numpy()
-        content_ref = self._get_hashed(content)
-
+        content_ref = self._concat_tensors(content)
         # reshape content to match Priority Queue shapes
-        content = list(map(lambda c: tf.squeeze(tf.cast(c, tf.float32)), content))
+        # content = list(map(lambda c: tf.squeeze(tf.cast(c, tf.float32)), content))
 
         # if lookup returns non-default value -> item exists, check priority and update
-        tf.cond(
-            tf.cast(
+
+        condt = tf.cast(
+            tf.math.not_equal(
+                self._entries_priority.lookup(str(content_ref)),
+                self._entries_priority._default_value,
+            )
+            or all(
                 tf.math.not_equal(
-                    self._entries.lookup(content_ref), self._entries._default_value
-                ),
-                tf.bool,
+                    self._entries_content.lookup(str(priority)),
+                    self._entries_content._default_value,
+                )
             ),
-            lambda: update_item(content_ref, content),
-            lambda: create_item(content_ref, content),
+            tf.bool,
         )
+        
+        if condt:
+            tf.print(condt)
+            update_item(content_ref, priority)
+        else:
+            create_item(content_ref, priority)
 
         return self.maxlen
 
@@ -132,16 +179,23 @@ class PQueue:
         """
 
         if tf.math.not_equal(self.size(), tf.constant(0, tf.int32)):
-            _, content = heapq.heappop(self._queue)
-            content_ref = self._get_hashed(content)
+            prev_priority = heapq.heappop(self._queue)
+            prev_priority = str(prev_priority)
 
-            self._entries.erase(tf.expand_dims(content_ref, -1))
-            item = content
-            for idx, i in enumerate(content):
-                if isinstance(i, tuple):
-                    item[idx] = list(i)
-            return item
+            content_ref = self._entries_content.lookup(prev_priority)
+            content = self._get_unstacked_tensors(content_ref)
 
+            content_ref = str(content_ref)
+            self._entries_priority.erase(tf.expand_dims(content_ref, -1))
+            self._entries_content.erase(tf.expand_dims(prev_priority, -1))
+
+            content = list(
+                map(
+                    lambda c: tf.reshape(tf.cast(c[0], c[1]), c[2]),
+                    zip(content, self.types, self.shapes),
+                )
+            )
+            return content
         else:
 
             return self.default_value

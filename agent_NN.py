@@ -10,7 +10,7 @@ import optuna
 gpus = tf.config.list_physical_devices("GPU")
 for gpu in gpus:
     tf.config.set_logical_device_configuration(
-        gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=8192)]
+        gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=2048)]
     )
 
 from utils import PQueue
@@ -209,19 +209,20 @@ class DynaQ:
                 self.env.render()
             s_prime = self.model.featurize(s_prime)
 
-            # Q-value update
             s = tf.reshape(s, (self.n_states, 1))
             s = tf.cast(s, tf.float32)
 
             s_prime = tf.reshape(s_prime, (self.n_states, 1))
             s_prime = tf.cast(s_prime, tf.float32)
+
+            # Q-value update
             update = self.update_q(s, a, r, s_prime).numpy()
             loss_q = self.q.learn()
             loss_model = self.model.learn()
 
             # Check if update > theta, if yes: push to PQueue
             if self.p_thresh_upper > abs(update) > self.p_thresh_lower:
-                self.p_queue.add(abs(update), [s, tf.cast(a, tf.int64)])
+                self.p_queue.add(update, [s, tf.cast(a, tf.int64)])
 
             # Planning for n steps
             self.__map_parallel_planning()
@@ -259,14 +260,14 @@ class DynaQ:
             a_ = tf.cast(a_bar, tf.int64)
             tf.py_function(
                 func=self.p_queue.add,
-                inp=[tf.math.abs(update), s_, a_],
+                inp=[tf.cast(update, tf.float32), s_, a_],
                 Tout=tf.float32,
             )
         return is_update
 
     @tf.function
     def __map_parallel_planning(self):
-        tf.map_fn(self.planning, tf.range(self.n), parallel_iterations=2)
+        tf.map_fn(self.planning, tf.range(self.n))
 
     @tf.function
     def planning(self, i):
@@ -289,22 +290,21 @@ class DynaQ:
             tf.map_fn(
                 lambda x: self._update_pqueue(s, a, s_bar, x),
                 actions,
-                fn_output_signature=tf.TensorSpec([], tf.bool),
-                parallel_iterations=2,
+                fn_output_signature=tf.TensorSpec([], tf.bool)
             )
         return i
 
 
-# def objective():
-def objective(trial: optuna.Trial):
+def objective():
+# def objective(trial: optuna.Trial):
     try:
-        alpha = trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
+        alpha = 0.03 # trial.suggest_float("alpha", 0.01, 0.1, step=0.01)
         gamma = 0.99  # trial.suggest_float("gamma", 0.5, 0.99)
         # epsilon = trial.suggest_float("epsilon", 0.5, 1.0, step=0.1)
-        lambd = trial.suggest_float("lambd", 0.1, 0.9, step=0.1)
+        lambd = 0.3# trial.suggest_float("lambd", 0.1, 0.9, step=0.1)
         epsilon = 0.4
         planning_steps = 10  # planning loop terminates if priority queue is empty
-        h_weight = trial.suggest_float("h_weight", 0.1, 1.0, step=0.1)
+        h_weight = 0.4 #trial.suggest_float("h_weight", 0.1, 1.0, step=0.1)
         env, env_params = make_env()
 
         max_steps = 1000
@@ -382,8 +382,8 @@ def objective(trial: optuna.Trial):
         return cumulative_reward
 
     except KeyboardInterrupt as e:
-        trial.study.stop()
-        # raise
+        # trial.study.stop()
+        raise
 
 
 if __name__ == "__main__":
@@ -394,15 +394,15 @@ if __name__ == "__main__":
     if not os.path.exists(log_folder):
         os.mkdir(log_folder)
 
-    study = optuna.create_study(
-        study_name="optuna_studies",
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(),
-    )
+    # study = optuna.create_study(
+    #     study_name="optuna_studies",
+    #     direction="maximize",
+    #     sampler=optuna.samplers.TPESampler(),
+    # )
 
-    try:
-        study.optimize(objective, n_trials=100, show_progress_bar=True)
+    # try:
+    #     study.optimize(objective, n_trials=100, show_progress_bar=True)
 
-    finally:
-        joblib.dump(study, "optuna_study.pkl")
-    # objective()
+    # finally:
+    #     joblib.dump(study, "optuna_study.pkl")
+    objective()
